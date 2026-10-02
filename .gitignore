@@ -1,0 +1,10 @@
+# Rust build output (kept out of the repo: ~400 MB of rebuildable artifacts)
+/target
+
+# Generated framebuffer captures from the display contracts
+*.ppm
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini

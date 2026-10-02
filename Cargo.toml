@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/oscore", "crates/osplat", "crates/myos"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+oscore = { path = "crates/oscore" }
+osplat = { path = "crates/osplat" }
+
+[profile.release]
+panic = "abort"
+overflow-checks = true

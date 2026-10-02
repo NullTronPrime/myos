@@ -1,0 +1,12 @@
+[package]
+name = "osplat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Host bindings for the parasitic OS: seccomp, SIGSYS, ucontext surgery."
+
+[dependencies]
+oscore = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

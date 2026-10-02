@@ -1,0 +1,6 @@
+# Normalise line endings so a Windows checkout still builds and runs on Linux:
+# shell scripts and assembly must stay LF, or `bash guest/contracts.sh` breaks.
+* text=auto eol=lf
+
+# Framebuffer captures are binary.
+*.ppm binary
