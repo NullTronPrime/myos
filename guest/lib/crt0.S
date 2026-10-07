@@ -18,4 +18,16 @@ _start:
     hlt
     .size _start, .-_start
 
+/* Signal return trampoline. A handler ends with an ordinary `ret`, which pops
+ * the frame's `pretcode` word and jumps here; that word is the `sa_restorer`
+ * the kernel recorded for the delivery. It is placed in `.text` rather than in
+ * the signal frame itself, because the guest stack is not executable. */
+    .globl minic_sigreturn
+    .type minic_sigreturn, @function
+minic_sigreturn:
+    movl $15, %eax             /* SYS_rt_sigreturn */
+    syscall
+    hlt                        /* rt_sigreturn must not fail to return */
+    .size minic_sigreturn, .-minic_sigreturn
+
     .section .note.GNU-stack,"",@progbits

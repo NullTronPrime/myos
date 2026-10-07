@@ -40,7 +40,12 @@ impl FrameAllocator {
             let last = bitmap.len() - 1;
             bitmap[last] = (1u64 << remainder) - 1;
         }
-        FrameAllocator { bitmap, base_frame, frame_count, free_count: frame_count }
+        FrameAllocator {
+            bitmap,
+            base_frame,
+            frame_count,
+            free_count: frame_count,
+        }
     }
 
     /// Builds an allocator sized to a backend, reserving frame 0.
@@ -90,7 +95,8 @@ impl FrameAllocator {
                 self.set_bit(i, false);
                 self.free_count -= 1;
                 backend.mark_allocated(frame).map_err(FrameError::Backend)?;
-                backend.zero(frame.byte_offset(), crate::addr::PAGE_SIZE)
+                backend
+                    .zero(frame.byte_offset(), crate::addr::PAGE_SIZE)
                     .map_err(FrameError::Backend)?;
                 return Ok(frame);
             }
@@ -123,7 +129,8 @@ impl FrameAllocator {
                     let base = Frame::from_index(self.base_frame + start as u64);
                     for k in start..=i {
                         self.set_bit(k, false);
-                        backend.mark_allocated(Frame::from_index(self.base_frame + k as u64))
+                        backend
+                            .mark_allocated(Frame::from_index(self.base_frame + k as u64))
                             .map_err(FrameError::Backend)?;
                     }
                     self.free_count -= count as u64;
@@ -195,7 +202,8 @@ mod tests {
     fn allocated_frames_are_zeroed() {
         let mut mem = SimMem::new(8);
         let mut a = FrameAllocator::new(1, 7);
-        mem.write(Frame::from_index(3).byte_offset(), &[0xff; 64]).unwrap();
+        mem.write(Frame::from_index(3).byte_offset(), &[0xff; 64])
+            .unwrap();
 
         let f = a.alloc(&mut mem).unwrap();
         assert!(mem.frame_slice(f).unwrap().iter().all(|b| *b == 0));

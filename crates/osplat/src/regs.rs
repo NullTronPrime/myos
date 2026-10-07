@@ -4,8 +4,8 @@
 //! offset arithmetic lives in one place. On x86-64 Linux the guest registers are
 //! in `gregs[]`, indexed by the `REG_*` constants.
 
-use oscore::syscall::{Registers, MAX_ARGS};
 use libc::{c_void, greg_t, ucontext_t};
+use oscore::syscall::{Registers, MAX_ARGS};
 
 /// Index of `rax` in `ucontext_t::gregs`. Holds the syscall number on entry.
 pub const REG_RAX: usize = libc::REG_RAX as usize;
@@ -111,7 +111,7 @@ pub unsafe fn read_cstr_guest(addr: u64, max: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut a = addr;
     while out.len() < max {
-        let b = *((a as *const u8));
+        let b = *(a as *const u8);
         if b == 0 {
             return Some(out);
         }

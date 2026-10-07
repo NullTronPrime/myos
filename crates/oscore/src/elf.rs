@@ -6,8 +6,8 @@
 
 use crate::addr::{self, AddrError, Perms, PAGE_SIZE};
 use crate::elf::class::{Class, Data, Type};
-use crate::space::AddressSpace;
 use crate::mem::MemBackend;
+use crate::space::AddressSpace;
 
 /// Size of the ELF64 identification block.
 pub const EI_NIDENT: usize = 16;
@@ -261,17 +261,19 @@ impl ElfBuilder {
             bytes[o..o + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
             bytes[o + 4..o + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
             bytes[o + 8..o + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
-            bytes[o + 16..o + 24].copy_from_slice(&(0x4000_0000u64 + PAGE_SIZE as u64 * i as u64).to_le_bytes());
-            bytes[o + 24..o + 32].copy_from_slice(&(0x4000_0000u64 + PAGE_SIZE as u64 * i as u64).to_le_bytes());
+            bytes[o + 16..o + 24]
+                .copy_from_slice(&(0x4000_0000u64 + PAGE_SIZE as u64 * i as u64).to_le_bytes());
+            bytes[o + 24..o + 32]
+                .copy_from_slice(&(0x4000_0000u64 + PAGE_SIZE as u64 * i as u64).to_le_bytes());
             bytes[o + 32..o + 40].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
             bytes[o + 40..o + 48].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
-            bytes[o + 48..o + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_align
+            bytes[o + 48..o + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+            // p_align
         }
 
         // Pad so every default segment's file range lies inside the image;
         // otherwise the default segments would fail validation by design.
-        let needed = (EHSIZE + phnum as usize * PHENTSIZE)
-            .max(PAGE_SIZE as usize * phnum as usize);
+        let needed = (EHSIZE + phnum as usize * PHENTSIZE).max(PAGE_SIZE as usize * phnum as usize);
         bytes.resize(needed, 0);
 
         ElfBuilder { bytes, phnum }
@@ -848,7 +850,10 @@ mod tests {
         assert_eq!(ph(4).perms(), Perms::READ);
         assert_eq!(ph(6).perms(), Perms::READ.union(Perms::WRITE));
         assert_eq!(ph(5).perms(), Perms::READ.union(Perms::EXEC));
-        assert_eq!(ph(7).perms(), Perms::READ.union(Perms::WRITE).union(Perms::EXEC));
+        assert_eq!(
+            ph(7).perms(),
+            Perms::READ.union(Perms::WRITE).union(Perms::EXEC)
+        );
         assert!(ph(0).perms().is_none(), "no PF_R means unusable");
         assert!(ph(2).perms().is_none(), "write-only is unusable too");
     }
@@ -864,9 +869,15 @@ mod tests {
             space.table.perms_at(0x4000_0000).unwrap(),
             Perms::READ.union(Perms::EXEC),
         );
-        assert!(space.table.frame_at(0x4000_0000 + PAGE_SIZE as u64).is_some());
+        assert!(space
+            .table
+            .frame_at(0x4000_0000 + PAGE_SIZE as u64)
+            .is_some());
         assert!(
-            space.table.frame_at(0x4000_0000 + 2 * PAGE_SIZE as u64).is_none(),
+            space
+                .table
+                .frame_at(0x4000_0000 + 2 * PAGE_SIZE as u64)
+                .is_none(),
             "nothing past the last segment should be mapped",
         );
     }

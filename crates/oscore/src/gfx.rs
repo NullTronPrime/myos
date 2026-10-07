@@ -40,7 +40,11 @@ impl Framebuffer {
     /// can validate as they see fit.
     pub fn new(width: u32, height: u32) -> Self {
         let len = (width as usize).saturating_mul(height as usize);
-        Framebuffer { width, height, pixels: vec![0; len] }
+        Framebuffer {
+            width,
+            height,
+            pixels: vec![0; len],
+        }
     }
 
     pub fn width(&self) -> u32 {
@@ -152,11 +156,7 @@ impl Framebuffer {
         for row in 0..GLYPH_HEIGHT {
             let line = bits[row as usize];
             for col in 0..GLYPH_WIDTH {
-                let color = if line & (1 << col) != 0 {
-                    Some(fg)
-                } else {
-                    bg
-                };
+                let color = if line & (1 << col) != 0 { Some(fg) } else { bg };
                 if let Some(c) = color {
                     self.set(x + col as i32, y + row as i32, c);
                 }
@@ -213,7 +213,11 @@ pub fn glyph(ch: char) -> Option<[u8; 8]> {
 
 /// Width in pixels of the longest line of `text`.
 pub fn text_width(text: &str) -> u32 {
-    text.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as u32 * GLYPH_WIDTH
+    text.split('\n')
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u32
+        * GLYPH_WIDTH
 }
 
 /// The public-domain `font8x8_basic` set, ASCII `0x20..=0x7E`.
@@ -338,7 +342,9 @@ pub struct Window {
 impl Window {
     /// Size of the pixel buffer in bytes.
     pub fn byte_len(&self) -> u64 {
-        (self.width as u64).saturating_mul(self.height as u64).saturating_mul(4)
+        (self.width as u64)
+            .saturating_mul(self.height as u64)
+            .saturating_mul(4)
     }
 
     fn is_empty(&self) -> bool {
@@ -372,7 +378,12 @@ impl Default for Display {
 impl Display {
     /// Builds an empty display.
     pub fn new(width: u32, height: u32) -> Self {
-        Display { width, height, next_id: 1, windows: Vec::new() }
+        Display {
+            width,
+            height,
+            next_id: 1,
+            windows: Vec::new(),
+        }
     }
 
     /// Display size in pixels.
@@ -610,12 +621,20 @@ mod tests {
 
         let fb = d
             .composite(|w| {
-                let c = if w.id == under { rgb(10, 0, 0) } else { rgb(0, 20, 0) };
+                let c = if w.id == under {
+                    rgb(10, 0, 0)
+                } else {
+                    rgb(0, 20, 0)
+                };
                 Ok(vec![c; (w.width * w.height) as usize])
             })
             .unwrap();
         assert_eq!(fb.get(0, 0), Some(rgb(0, 20, 0)), "top window wins");
-        assert_eq!(fb.get(3, 3), Some(rgb(10, 0, 0)), "lower window shows through");
+        assert_eq!(
+            fb.get(3, 3),
+            Some(rgb(10, 0, 0)),
+            "lower window shows through"
+        );
         assert_eq!(fb.get(7, 7), Some(BACKGROUND));
     }
 

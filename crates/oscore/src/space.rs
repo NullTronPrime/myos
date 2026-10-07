@@ -5,9 +5,7 @@
 //! runs in unit tests: map, unmap, protect, translate, and simulate faults
 //! against a simulated machine.
 
-use crate::addr::{
-    self, AddrError, Frame, Perms, PAGE_SIZE,
-};
+use crate::addr::{self, AddrError, Frame, Perms, PAGE_SIZE};
 use crate::frame::FrameAllocator;
 use crate::mem::MemBackend;
 use std::collections::BTreeMap;
@@ -34,7 +32,9 @@ impl Default for PageTable {
 
 impl PageTable {
     pub fn new() -> Self {
-        PageTable { entries: BTreeMap::new() }
+        PageTable {
+            entries: BTreeMap::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -54,8 +54,7 @@ impl PageTable {
         if frame.is_null() {
             return Err(AddrError::OutOfRange);
         }
-        self.entries
-            .insert(vpage, Mapping { frame, perms });
+        self.entries.insert(vpage, Mapping { frame, perms });
         Ok(())
     }
 
@@ -100,7 +99,9 @@ impl PageTable {
     /// Translates without checking permissions. Used by unmap and by dump.
     pub fn translate_raw(&self, vaddr: u64) -> Option<u64> {
         let (vpage, off) = addr::split_page(vaddr);
-        self.entries.get(&vpage).map(|m| m.frame.byte_offset() + off as u64)
+        self.entries
+            .get(&vpage)
+            .map(|m| m.frame.byte_offset() + off as u64)
     }
 
     /// Looks up the frame backing a virtual page.
@@ -172,7 +173,11 @@ impl<M: MemBackend> AddressSpace<M> {
     /// Builds an address space over `mem`, managing every frame but the first.
     pub fn new(mem: M) -> Self {
         let allocator = FrameAllocator::for_backend(&mem);
-        AddressSpace { table: PageTable::new(), allocator, mem }
+        AddressSpace {
+            table: PageTable::new(),
+            allocator,
+            mem,
+        }
     }
 
     /// Borrows the backend for device or dump code.
@@ -190,12 +195,7 @@ impl<M: MemBackend> AddressSpace<M> {
     }
 
     /// Maps `len` bytes at `vaddr` onto freshly allocated zeroed frames.
-    pub fn map_anon(
-        &mut self,
-        vaddr: u64,
-        len: u64,
-        perms: Perms,
-    ) -> Result<(), AddrError> {
+    pub fn map_anon(&mut self, vaddr: u64, len: u64, perms: Perms) -> Result<(), AddrError> {
         if !addr::is_canonical(vaddr) {
             return Err(AddrError::NonCanonical);
         }
@@ -213,7 +213,9 @@ impl<M: MemBackend> AddressSpace<M> {
         let mut freed = 0;
         for vpage in addr::page_range(vaddr, len) {
             if let Ok(frame) = self.table.unmap(vpage) {
-                self.allocator.free(&mut self.mem, frame).map_err(|_| AddrError::OutOfRange)?;
+                self.allocator
+                    .free(&mut self.mem, frame)
+                    .map_err(|_| AddrError::OutOfRange)?;
                 freed += 1;
             }
         }
@@ -288,7 +290,9 @@ impl<M: MemBackend> AddressSpace<M> {
     }
 
     fn alloc_frame(&mut self) -> Result<Frame, AddrError> {
-        self.allocator.alloc(&mut self.mem).map_err(|_| AddrError::OutOfRange)
+        self.allocator
+            .alloc(&mut self.mem)
+            .map_err(|_| AddrError::OutOfRange)
     }
 }
 
@@ -324,7 +328,11 @@ pub struct FaultHandler<'a, M: MemBackend> {
 
 impl<'a, M: MemBackend> FaultHandler<'a, M> {
     pub fn new(space: &'a mut AddressSpace<M>, heap_start: u64, heap_end: u64) -> Self {
-        FaultHandler { space, heap_start, heap_end }
+        FaultHandler {
+            space,
+            heap_start,
+            heap_end,
+        }
     }
 
     /// Classifies a fault without changing anything.
@@ -376,9 +384,13 @@ mod tests {
     #[test]
     fn map_and_translate_roundtrip() {
         let mut t = PageTable::new();
-        t.map(0x4000_0000, Frame::from_index(10), Perms::RWX).unwrap();
+        t.map(0x4000_0000, Frame::from_index(10), Perms::RWX)
+            .unwrap();
 
-        assert_eq!(t.translate(0x4000_0000, Perms::READ), Ok(10 * PAGE_SIZE as u64));
+        assert_eq!(
+            t.translate(0x4000_0000, Perms::READ),
+            Ok(10 * PAGE_SIZE as u64)
+        );
         assert_eq!(
             t.translate(0x4000_0fff, Perms::READ),
             Ok(10 * PAGE_SIZE as u64 + 0xfff)
@@ -420,7 +432,10 @@ mod tests {
             t.map(0x0000_8000_0000_0000, Frame::from_index(1), Perms::RW),
             Err(AddrError::NonCanonical)
         );
-        assert_eq!(t.translate(0x0000_8000_0000_0000, Perms::RW), Err(AddrError::NonCanonical));
+        assert_eq!(
+            t.translate(0x0000_8000_0000_0000, Perms::RW),
+            Err(AddrError::NonCanonical)
+        );
         assert!(t.is_empty());
     }
 
@@ -452,7 +467,10 @@ mod tests {
         assert_eq!(t.translate(0x8000, Perms::WRITE), Ok(3 * PAGE_SIZE as u64));
 
         t.protect(0x8000, Perms::NONE).unwrap();
-        assert_eq!(t.translate(0x8000, Perms::READ), Err(AddrError::PermissionDenied));
+        assert_eq!(
+            t.translate(0x8000, Perms::READ),
+            Err(AddrError::PermissionDenied)
+        );
     }
 
     #[test]
@@ -467,8 +485,12 @@ mod tests {
     fn merged_regions_coalesce_adjacent_same_perms() {
         let mut t = PageTable::new();
         for (i, perms) in [(0, Perms::RW), (1, Perms::RW), (2, Perms::READ)] {
-            t.map(0x1000 + i * PAGE_SIZE as u64, Frame::from_index(i as u64 + 1), perms)
-                .unwrap();
+            t.map(
+                0x1000 + i * PAGE_SIZE as u64,
+                Frame::from_index(i as u64 + 1),
+                perms,
+            )
+            .unwrap();
         }
         let regions = t.merged_regions();
         assert_eq!(regions.len(), 2);
@@ -484,7 +506,8 @@ mod tests {
         let mut s = space(64);
         let before = s.free_frames();
 
-        s.map_anon(0x4000_0000, PAGE_SIZE as u64 * 4, Perms::RW).unwrap();
+        s.map_anon(0x4000_0000, PAGE_SIZE as u64 * 4, Perms::RW)
+            .unwrap();
         assert_eq!(s.free_frames(), before - 4);
         assert_eq!(s.table.len(), 4);
 
@@ -596,7 +619,8 @@ mod tests {
     #[test]
     fn protection_fault_is_never_satisfiable() {
         let mut s = space(64);
-        s.map_anon(0x4000_0000, PAGE_SIZE as u64, Perms::READ).unwrap();
+        s.map_anon(0x4000_0000, PAGE_SIZE as u64, Perms::READ)
+            .unwrap();
         let mut h = FaultHandler::new(&mut s, 0x4000_0000, 0x8000_0000);
 
         assert_eq!(

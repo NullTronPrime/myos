@@ -23,6 +23,9 @@ typedef int pid_t;
 #define SYS_mprotect  10
 #define SYS_munmap    11
 #define SYS_brk       12
+#define SYS_rt_sigaction 13
+#define SYS_rt_sigprocmask 14
+#define SYS_rt_sigreturn 15
 #define SYS_ioctl     16
 #define SYS_writev    20
 #define SYS_pipe      22
@@ -33,6 +36,7 @@ typedef int pid_t;
 #define SYS_execve    59
 #define SYS_exit      60
 #define SYS_wait4     61
+#define SYS_kill      62
 #define SYS_openat    257
 
 #define AT_FDCWD (-100)
@@ -71,6 +75,83 @@ int execve(const char *path, char *const argv[], char *const envp[]);
 pid_t wait4(pid_t pid, int *status, int options, void *rusage);
 int pipe(int fds[2]);
 int dup2(int oldfd, int newfd);
+
+/* --- signals -----------------------------------------------------------
+ *
+ * The OS owns signal delivery, so these are the mediated calls rather than the
+ * host's. `mysigaction` is the kernel's own `struct sigaction`; leaving
+ * `restorer` zero is allowed here, because the OS synthesises one and an
+ * ordinary `return` out of the handler comes back through `rt_sigreturn`. */
+#define SA_SIGINFO 0x00000004
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+#define SIGHUP  1
+#define SIGINT  2
+#define SIGQUIT 3
+#define SIGILL  4
+#define SIGTRAP 5
+#define SIGABRT 6
+#define SIGBUS  7
+#define SIGFPE  8
+#define SIGKILL 9
+#define SIGUSR1 10
+#define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
+#define SIGTERM 15
+
+/* The leading fields of `siginfo_t`, which is much larger. `addr` carries the
+ * faulting address for SIGSEGV and the sender's pid for a raised signal. */
+typedef struct mysiginfo {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    int __pad;
+    unsigned long si_addr;
+} mysiginfo;
+
+/* `ucontext_t` up to the register file. Only `uc_mcontext.gregs` is named here;
+ * `gregs[16]` is `rip`. */
+typedef struct myucontext {
+    unsigned long uc_flags;
+    unsigned long uc_link;
+    unsigned long uc_stack[3];
+    unsigned long gregs[23];
+} myucontext;
+
+#define uc_rip (uc->gregs[16])
+
+typedef void (*mysighandler_t)(int, mysiginfo *, myucontext *);
+
+/* The two dispositions that are not a handler address. The trailing underscore
+ * keeps them from colliding with the same macros from a real `<signal.h>`. */
+#define SIG_DFL_ ((mysighandler_t)0)
+#define SIG_IGN_ ((mysighandler_t)1)
+
+typedef struct mysigaction {
+    mysighandler_t handler;
+    unsigned long flags;
+    unsigned long restorer;
+    unsigned long mask;
+} mysigaction;
+
+int sigaction(int signum, const mysigaction *act, mysigaction *old);
+int sigprocmask(int how, const unsigned long *set, unsigned long *old);
+int kill(pid_t pid, int signo);
+
+/* `sa_restorer` for handlers installed through `sigaction`. A handler returns
+ * to this, which issues `rt_sigreturn`; a real handler cannot do without one,
+ * so `sigaction` fills it in when the caller left it zero. */
+void minic_sigreturn(void);
+
+/* `raise(signo)`, spelled with a trailing underscore because glibc's
+ * `<signal.h>` declares `raise` as `noreturn` and a guest that pulls in both
+ * headers would otherwise disagree about the same name. */
+int raise_(int signo);
 
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);

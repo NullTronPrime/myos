@@ -71,7 +71,11 @@ impl Rela {
 
 /// Returns the image's `PT_DYNAMIC` header, if it has one.
 pub fn dynamic_header(image: &ElfImage) -> Option<ProgramHeader> {
-    image.segments.iter().find(|p| p.ptype == PT_DYNAMIC).copied()
+    image
+        .segments
+        .iter()
+        .find(|p| p.ptype == PT_DYNAMIC)
+        .copied()
 }
 
 /// Parses the `(tag, value)` pairs of a `PT_DYNAMIC` segment, up to `DT_NULL`.
@@ -190,7 +194,10 @@ where
     for r in relocs {
         match r.rtype() {
             R_X86_64_RELATIVE => {
-                write(base.wrapping_add(r.offset), base.wrapping_add(r.addend as u64));
+                write(
+                    base.wrapping_add(r.offset),
+                    base.wrapping_add(r.addend as u64),
+                );
             }
             R_X86_64_NONE => {}
             other => return Err(other),
@@ -255,7 +262,12 @@ mod tests {
         put_u64(&mut bytes, 0x20, DT_NULL as u64);
         // A trailing entry after DT_NULL must be ignored.
         put_u64(&mut bytes, 0x30, 0xdead);
-        let ph = ProgramHeader { ptype: PT_DYNAMIC, filesz: 0x30, offset: 0x10, ..load(0, 0, 0) };
+        let ph = ProgramHeader {
+            ptype: PT_DYNAMIC,
+            filesz: 0x30,
+            offset: 0x10,
+            ..load(0, 0, 0)
+        };
         let tags = dynamic_table(&bytes, &ph).unwrap();
         assert_eq!(tags, vec![(DT_RELA, 0x200), (DT_NULL, 0)]);
     }
@@ -300,7 +312,12 @@ mod tests {
         rela_entry(&mut bytes, 0x100, 0x5000, R_X86_64_RELATIVE as u64, 0x100);
         rela_entry(&mut bytes, 0x160, 0x5008, R_X86_64_RELATIVE as u64, 0x200);
 
-        let ph = ProgramHeader { ptype: PT_DYNAMIC, offset: 0x10, filesz: 0x60, ..load(0, 0, 0) };
+        let ph = ProgramHeader {
+            ptype: PT_DYNAMIC,
+            offset: 0x10,
+            filesz: 0x60,
+            ..load(0, 0, 0)
+        };
         let img = image(vec![load(0, 0x4000, 0x1000), ph]);
         let rs = relocations(&bytes, &img).unwrap();
         assert_eq!(rs.len(), 2);
@@ -311,9 +328,21 @@ mod tests {
     #[test]
     fn apply_static_writes_base_plus_addend() {
         let relocs = vec![
-            Rela { offset: 0x5000, info: R_X86_64_RELATIVE as u64, addend: 0x303a },
-            Rela { offset: 0x5008, info: R_X86_64_RELATIVE as u64, addend: 0x3040 },
-            Rela { offset: 0x5010, info: R_X86_64_NONE as u64, addend: 0 },
+            Rela {
+                offset: 0x5000,
+                info: R_X86_64_RELATIVE as u64,
+                addend: 0x303a,
+            },
+            Rela {
+                offset: 0x5008,
+                info: R_X86_64_RELATIVE as u64,
+                addend: 0x3040,
+            },
+            Rela {
+                offset: 0x5010,
+                info: R_X86_64_NONE as u64,
+                addend: 0,
+            },
         ];
         let mut stores = Vec::new();
         apply_static(&relocs, 0x10000, |a, v| stores.push((a, v))).unwrap();
@@ -322,7 +351,11 @@ mod tests {
 
     #[test]
     fn apply_static_rejects_symbol_relocations() {
-        let relocs = vec![Rela { offset: 0x1000, info: R_X86_64_GLOB_DAT as u64, addend: 0 }];
+        let relocs = vec![Rela {
+            offset: 0x1000,
+            info: R_X86_64_GLOB_DAT as u64,
+            addend: 0,
+        }];
         assert_eq!(apply_static(&relocs, 0, |_, _| {}), Err(R_X86_64_GLOB_DAT));
     }
 }

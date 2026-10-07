@@ -15,6 +15,12 @@ pub mod regs;
 #[cfg(target_os = "linux")]
 pub mod loader;
 
+#[cfg(target_os = "linux")]
+pub mod display;
+
+#[cfg(target_os = "linux")]
+pub mod signal;
+
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "osplat requires Linux: the parasitic OS traps syscalls with seccomp-bpf, \

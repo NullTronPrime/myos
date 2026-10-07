@@ -88,7 +88,11 @@ impl SimMem {
     /// Creates a simulator with `frames` frames of 4 KiB each.
     pub fn new(frames: u64) -> Self {
         let bytes = (frames * PAGE_SIZE as u64) as usize;
-        SimMem { data: vec![0u8; bytes], frames, allocated: BTreeMap::new() }
+        SimMem {
+            data: vec![0u8; bytes],
+            frames,
+            allocated: BTreeMap::new(),
+        }
     }
 
     /// Number of frames currently marked allocated.
@@ -117,9 +121,7 @@ impl MemBackend for SimMem {
         if start > self.data.len() {
             return Err(MemError::OutOfRange);
         }
-        let end = start
-            .checked_add(buf.len())
-            .ok_or(MemError::Bounds)?;
+        let end = start.checked_add(buf.len()).ok_or(MemError::Bounds)?;
         if end > self.data.len() {
             return Err(MemError::OutOfRange);
         }
@@ -132,9 +134,7 @@ impl MemBackend for SimMem {
         if start > self.data.len() {
             return Err(MemError::OutOfRange);
         }
-        let end = start
-            .checked_add(buf.len())
-            .ok_or(MemError::Bounds)?;
+        let end = start.checked_add(buf.len()).ok_or(MemError::Bounds)?;
         if end > self.data.len() {
             return Err(MemError::OutOfRange);
         }
@@ -271,7 +271,12 @@ mod tests {
         mem.zero(10, 5).unwrap();
         assert!(mem.bytes()[10..15].iter().all(|b| *b == 0));
         assert!(mem.bytes()[15..PAGE_SIZE].iter().all(|b| *b == 0xaa));
-        assert_eq!(mem.bytes()[PAGE_SIZE..PAGE_SIZE + 10].iter().all(|b| *b == 0), true);
+        assert_eq!(
+            mem.bytes()[PAGE_SIZE..PAGE_SIZE + 10]
+                .iter()
+                .all(|b| *b == 0),
+            true
+        );
     }
 
     #[test]

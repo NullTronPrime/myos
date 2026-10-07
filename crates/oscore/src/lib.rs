@@ -9,17 +9,22 @@
 #![forbid(unsafe_code)]
 
 pub mod addr;
+pub mod clock;
 pub mod elf;
 pub mod frame;
 pub mod gfx;
+pub mod input;
 pub mod link;
 pub mod mem;
+pub mod persist;
 pub mod sched;
+pub mod signal;
 pub mod space;
 pub mod syscall;
 pub mod vfs;
 
 pub use addr::{Frame, Perms, PAGE_SIZE};
+pub use clock::{Clock, Timespec};
 pub use mem::{MemBackend, MemError, SimMem};
 pub use vfs::{Errno, Vfs};
 

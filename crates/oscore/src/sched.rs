@@ -240,16 +240,17 @@ impl Scheduler {
         let due: Vec<Pid> = self
             .tasks
             .values()
-            .filter(|t| {
-                t.state == State::Blocked && t.blocked_on == Some(BlockReason::Sleep)
-            })
+            .filter(|t| t.state == State::Blocked && t.blocked_on == Some(BlockReason::Sleep))
             .map(|t| t.pid)
             .collect();
         // Sleeping tasks carry their deadline in quantum_left slots; those at or
         // past `now` become ready. Deadline 0 means "any time", so it wakes.
         let mut woken = Vec::new();
         for pid in due {
-            let ready = self.get(pid).map(|t| t.quantum_left as u64 <= now).unwrap_or(false);
+            let ready = self
+                .get(pid)
+                .map(|t| t.quantum_left as u64 <= now)
+                .unwrap_or(false);
             if ready && self.make_ready(pid).is_ok() {
                 woken.push(pid);
             }
@@ -259,7 +260,10 @@ impl Scheduler {
 
     /// Number of runnable tasks.
     pub fn runnable_count(&self) -> usize {
-        self.tasks.values().filter(|t| t.state.is_runnable()).count()
+        self.tasks
+            .values()
+            .filter(|t| t.state.is_runnable())
+            .count()
     }
 
     /// Number of tasks in a given priority queue, runnable only.
@@ -522,7 +526,11 @@ mod tests {
         for _ in 0..4 {
             order.push(s.pick_next().unwrap());
         }
-        assert_eq!(order, vec![h1, h2, h1, h2], "equal priority must round-robin");
+        assert_eq!(
+            order,
+            vec![h1, h2, h1, h2],
+            "equal priority must round-robin"
+        );
         s.validate().unwrap();
     }
 

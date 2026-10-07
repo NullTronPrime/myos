@@ -1,8 +1,12 @@
 # Roadmap: from library OS to a usable windowed OS
 
 This is a working checklist. It is based on an audit of every module in the
-repo. The short version: the architecture is a real hosted library OS, but the
-windowing is offscreen-only and several core modules are tested-but-unwired.
+repo. The short version: the architecture is a real hosted library OS. The
+original "offscreen-only, tested-but-unwired" state has largely been reversed:
+clock, signals, persistence, and a live X11/Wayland-capable display path are
+now wired at runtime. Remaining gap areas are threads/futex, readiness
+(poll/select/epoll), a shared libc, robust isolation, and the window-system
+front end.
 
 ## Where it is today
 
@@ -46,9 +50,10 @@ The rest assumes **A**, with the simulation core flagged for removal or reuse.
 
 - [ ] Decide the fate of `frame`/`mem`/`space`/`sched`: wire them or delete them.
       Dead "kernel" code is worse than none.
-- [ ] Give the OS a real clock:
-      `clock_gettime` (229) currently returns the zero epoch; add `nanosleep`,
-      `clock_getres`, `gettimeofday`. Nothing that waits can work without this.
+- [x] Give the OS a real clock:
+      `clock_gettime` (228), `clock_getres` (229), `clock_nanosleep` (230),
+      `nanosleep` (35), and `gettimeofday` (96) are all dispatched; the platform
+      refreshes `Clock` from the host before every syscall.
 - [ ] File metadata: `stat` / `fstat` / `newfstatat` / `statx`, `access`.
       Dynamic linkers and every shell builtin ask for these.
 - [ ] Directory iteration: `getdents64` (the VFS already has `Dir` + `lookup`).

@@ -255,6 +255,38 @@ if [[ -x $MYOS ]]; then
             bad "pie_guest has no relative relocations to exercise the loader"
         fi
     fi
+
+    # 19. Signals: a guest installs handlers, raises one with kill, blocks
+    #     another, and faults on a read-only page. Delivery, the handler's
+    #     three arguments, the return through rt_sigreturn, blocking and the
+    #     siginfo a fault carries are all the guest's to check, because a
+    #     glibc-built guest would be signalling the host instead: its `raise`
+    #     uses `tgkill` from an address outside the guest's text, which the
+    #     seccomp filter lets straight through.
+    "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
+        -Ilib -O2 -o "$out/signal_guest" lib/crt0.S lib/minic.c signal_guest.c || exit 1
+    r=$("$MYOS" "$out/signal_guest" 2>/dev/null); rc=$?
+    if has "ok handler ran with the right arguments" "$r" \
+        && has "ok handler returned through rt_sigreturn" "$r" \
+        && has "ok blocked signal stayed pending" "$r" \
+        && has "ok unblocking delivered the pending signal" "$r" \
+        && has "ok guest fault became a guest signal with the right si_addr" "$r" \
+        && [ "$rc" -eq 0 ]; then
+        ok "signals are delivered, blocked and reported to the guest"
+    else
+        bad "signal_guest: rc=$rc out=$r"
+    fi
+    # A handler with no sa_restorer could never return, so the install is
+    # refused the way a real kernel refuses it.
+    "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
+        -Ilib -O2 -o "$out/no_restorer" lib/crt0.S lib/minic.c no_restorer.c || exit 1
+    r=$("$MYOS" "$out/no_restorer" 2>/dev/null); rc=$?
+    if has "ok rt_sigaction refused a handler with no restorer" "$r" \
+        && has "ok rt_sigaction accepted a handler with one" "$r" && [ "$rc" -eq 0 ]; then
+        ok "a handler without a restorer is refused"
+    else
+        bad "no_restorer: rc=$rc out=$r"
+    fi
 else
     echo "skip myos end-to-end checks ($MYOS not built)"
 fi

@@ -12,7 +12,10 @@ use std::ffi::CString;
 
 /// Files the guest filesystem starts with.
 const INITRD: &[(&str, &[u8])] = &[
-    ("/motd", b"myos: parasitic kernel, running inside a process.\n"),
+    (
+        "/motd",
+        b"myos: parasitic kernel, running inside a process.\n",
+    ),
     ("/version", NAME_VERSION.as_bytes()),
 ];
 
@@ -104,12 +107,23 @@ fn main() {
         }
     }
 
+    // Open a real window if there is a display server. This is optional: with no
+    // `DISPLAY`, a refused connection, no socket or a server that never answers,
+    // the OS keeps running against its in-memory framebuffer and the guest
+    // simply receives no input events.
+    match osplat::display::connect() {
+        Some(()) => eprintln!("myos: display connected"),
+        None => eprintln!("myos: no display server; running headless"),
+    }
+
     // In `--exec` mode the first argument is the guest-visible `argv[0]` and the
     // second is the host path to load; they differ when a rootfs translated it.
     let (program, guest_args): (String, Vec<String>) = if exec_mode {
         (
             args[1].clone(),
-            std::iter::once(args[0].clone()).chain(args[2..].iter().cloned()).collect(),
+            std::iter::once(args[0].clone())
+                .chain(args[2..].iter().cloned())
+                .collect(),
         )
     } else {
         (args[0].clone(), args.clone())
@@ -121,7 +135,10 @@ fn main() {
     };
     let image = match ElfImage::parse(&bytes) {
         Ok(i) => i,
-        Err(e) => fail(format_args!("{program} is not a runnable ELF: {}", e.as_str())),
+        Err(e) => fail(format_args!(
+            "{program} is not a runnable ELF: {}",
+            e.as_str()
+        )),
     };
 
     let c_args: Vec<CString> = guest_args

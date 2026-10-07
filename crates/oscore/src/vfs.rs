@@ -30,9 +30,114 @@ pub enum Errno {
     Fault = 14,
     /// Out of file descriptors. Linux value is 24.
     Mfile = 24,
+    /// Result too large to fit. Linux value is 34.
+    Range = 34,
 }
 
 pub type VfsResult<T> = Result<T, Errno>;
+
+/// A Linux-style `struct stat`, which is what `stat`/`fstat` return.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Stat {
+    /// Device id. A single in-memory filesystem, so this is always 0.
+    pub dev: u64,
+    pub ino: u64,
+    /// Hard link count.
+    pub nlink: u64,
+    /// Unix mode bits, `S_IFREG`/`S_IFDIR` already ORed in.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Padding the Linux layout keeps before the size field.
+    pub pad0: u32,
+    pub size: u64,
+    pub blksize: u64,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
+impl Stat {
+    /// Byte size of the guest struct this serialises into.
+    pub const BYTE_LEN: usize = 144;
+
+    /// Linux `S_IFMT` mask.
+    pub const S_IFMT: u32 = 0o170000;
+    /// Regular file.
+    pub const S_IFREG: u32 = 0o100000;
+    /// Directory.
+    pub const S_IFDIR: u32 = 0o040000;
+
+    pub fn is_dir(&self) -> bool {
+        self.mode & Self::S_IFMT == Self::S_IFDIR
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.mode & Self::S_IFMT == Self::S_IFREG
+    }
+
+    /// Serialises to the exact Linux x86-64 layout, so a guest's `struct stat`
+    /// needs no patching.
+    pub fn to_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut out = [0u8; Self::BYTE_LEN];
+        let put = |out: &mut [u8; Self::BYTE_LEN], off: usize, bytes: &[u8]| {
+            out[off..off + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut out, 0, &self.dev.to_le_bytes());
+        put(&mut out, 8, &self.ino.to_le_bytes());
+        put(&mut out, 16, &self.nlink.to_le_bytes());
+        put(&mut out, 24, &self.mode.to_le_bytes());
+        put(&mut out, 28, &self.uid.to_le_bytes());
+        put(&mut out, 32, &self.gid.to_le_bytes());
+        put(&mut out, 36, &self.pad0.to_le_bytes());
+        put(&mut out, 40, &self.size.to_le_bytes());
+        put(&mut out, 48, &self.blksize.to_le_bytes());
+        put(&mut out, 56, &self.blocks.to_le_bytes());
+        put(&mut out, 64, &self.atime_sec.to_le_bytes());
+        put(&mut out, 72, &self.atime_nsec.to_le_bytes());
+        put(&mut out, 80, &self.mtime_sec.to_le_bytes());
+        put(&mut out, 88, &self.mtime_nsec.to_le_bytes());
+        put(&mut out, 96, &self.ctime_sec.to_le_bytes());
+        put(&mut out, 104, &self.ctime_nsec.to_le_bytes());
+        out
+    }
+
+    /// Parses the guest struct. Returns `None` for a buffer that is too short.
+    pub fn from_bytes(b: &[u8]) -> Option<Stat> {
+        if b.len() < Self::BYTE_LEN {
+            return None;
+        }
+        // Every read is bounds-checked against the length test above, so `unwrap` here
+        // cannot actually fail.
+        let word = |off: usize| -> [u8; 8] { b[off..off + 8].try_into().unwrap() };
+        let dword = |off: usize| -> [u8; 4] { b[off..off + 4].try_into().unwrap() };
+        let w = |off: usize| u64::from_le_bytes(word(off));
+        let d = |off: usize| u32::from_le_bytes(dword(off));
+        let s = |off: usize| i64::from_le_bytes(word(off));
+        Some(Stat {
+            dev: w(0),
+            ino: w(8),
+            nlink: w(16),
+            mode: d(24),
+            uid: d(28),
+            gid: d(32),
+            pad0: d(36),
+            size: w(40),
+            blksize: w(48),
+            blocks: w(56),
+            atime_sec: s(64),
+            atime_nsec: s(72),
+            mtime_sec: s(80),
+            mtime_nsec: s(88),
+            ctime_sec: s(96),
+            ctime_nsec: s(104),
+        })
+    }
+}
 
 /// Identifies an inode within the filesystem.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -94,7 +199,9 @@ impl Default for RamDisk {
 
 impl RamDisk {
     pub fn new(blocks: u64) -> Self {
-        RamDisk { blocks: vec![[0u8; crate::addr::PAGE_SIZE]; blocks as usize] }
+        RamDisk {
+            blocks: vec![[0u8; crate::addr::PAGE_SIZE]; blocks as usize],
+        }
     }
 }
 
@@ -142,6 +249,12 @@ pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_DIRECTORY: u32 = 0o200000;
+/// Force every write to the current end of the file.
+pub const O_APPEND: u32 = 0o2000;
+/// Do not block. Advisory here: nothing in the VFS waits.
+pub const O_NONBLOCK: u32 = 0o4000;
+/// Close the descriptor on `execve`.
+pub const O_CLOEXEC: u32 = 0o2000000;
 
 /// Bits that select access mode rather than a modifier.
 const O_ACCMODE: u32 = 3;
@@ -155,7 +268,10 @@ impl Default for Vfs {
 impl Vfs {
     /// Creates a filesystem with an empty root directory.
     pub fn new() -> Self {
-        let mut vfs = Vfs { inodes: BTreeMap::new(), next_ino: 2 };
+        let mut vfs = Vfs {
+            inodes: BTreeMap::new(),
+            next_ino: 2,
+        };
         vfs.inodes.insert(
             1,
             Inode {
@@ -172,11 +288,100 @@ impl Vfs {
         self.inodes.len()
     }
 
+    /// Fills in a `stat` for an inode.
+    ///
+    /// Timestamps come from `now` rather than being invented, so a guest that
+    /// compares an `mtime` against its own clock sees a consistent value.
+    pub fn stat(&self, ino: Ino, now: crate::clock::Timespec) -> VfsResult<Stat> {
+        let node = self.get(ino)?;
+        let ifmt = if node.kind.is_dir() {
+            Stat::S_IFDIR
+        } else {
+            Stat::S_IFREG
+        };
+        let size = node.kind.size();
+        Ok(Stat {
+            dev: 0,
+            ino: ino.0,
+            nlink: if node.kind.is_dir() { 2 } else { 1 },
+            mode: ifmt | (node.mode & 0o7777),
+            uid: 0,
+            gid: 0,
+            pad0: 0,
+            size,
+            // 4 KiB blocks, rounding a short file up to one block, as Linux does.
+            blksize: crate::addr::PAGE_SIZE as u64,
+            blocks: size.div_ceil(512),
+            atime_sec: now.sec,
+            atime_nsec: now.nsec,
+            mtime_sec: now.sec,
+            mtime_nsec: now.nsec,
+            ctime_sec: now.sec,
+            ctime_nsec: now.nsec,
+        })
+    }
+
+    /// Every inode, in inode order. Used by the persistence layer to walk the
+    /// whole tree without repeating path resolution per node.
+    pub fn nodes(&self) -> Vec<&Inode> {
+        self.inodes.values().collect()
+    }
+
+    /// Full contents of a regular file, empty for anything else.
+    pub fn contents(&self, ino: Ino) -> Vec<u8> {
+        match &self.get(ino).map(|n| &n.kind) {
+            Ok(NodeKind::File(d)) => d.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Absolute path of an inode, or `/` for the root.
+    ///
+    /// Walks parent links upward by searching each directory for the child
+    /// that points here. Bounded by the inode count, so a cycle cannot hang it.
+    pub fn path_of(&self, target: Ino) -> String {
+        if target == Ino(1) || !self.inodes.contains_key(&target.0) {
+            return "/".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = target;
+        for _ in 0..=self.inodes.len() {
+            if cur == Ino(1) {
+                break;
+            }
+            let Some((parent, name)) = self.parent_of(cur) else {
+                break;
+            };
+            parts.push(name);
+            cur = parent;
+        }
+        parts.reverse();
+        if parts.is_empty() {
+            return "/".to_string();
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    /// Finds the directory containing `target` and the name it is stored under.
+    fn parent_of(&self, target: Ino) -> Option<(Ino, String)> {
+        for (parent_ino, node) in &self.inodes {
+            let NodeKind::Dir(children) = &node.kind else {
+                continue;
+            };
+            for (name, child) in children {
+                if *child == target {
+                    return Some((Ino(*parent_ino), name.clone()));
+                }
+            }
+        }
+        None
+    }
+
     pub fn get(&self, ino: Ino) -> VfsResult<&Inode> {
         self.inodes.get(&ino.0).ok_or(Errno::Badf)
     }
 
-    fn get_mut(&mut self, ino: Ino) -> VfsResult<&mut Inode> {
+    pub fn get_mut(&mut self, ino: Ino) -> VfsResult<&mut Inode> {
         self.inodes.get_mut(&ino.0).ok_or(Errno::Badf)
     }
 
@@ -229,7 +434,11 @@ impl Vfs {
         let mut comps = Self::normalize(path)?;
         let last = comps.pop().ok_or(Errno::Inval)?;
         let parent_path = format!("/{}", comps.join("/"));
-        let parent = if parent_path == "/" && comps.is_empty() { Ino(1) } else { self.lookup(&parent_path)? };
+        let parent = if parent_path == "/" && comps.is_empty() {
+            Ino(1)
+        } else {
+            self.lookup(&parent_path)?
+        };
         match self.get(parent)?.kind {
             NodeKind::Dir(_) => {}
             NodeKind::File(_) => return Err(Errno::NotDir),
@@ -252,7 +461,12 @@ impl Vfs {
         self.next_ino += 1;
         self.inodes.insert(
             ino.0,
-            Inode { ino, kind: NodeKind::File(data.to_vec()), mode: 0o644, nlink: 1 },
+            Inode {
+                ino,
+                kind: NodeKind::File(data.to_vec()),
+                mode: 0o644,
+                nlink: 1,
+            },
         );
         if let NodeKind::Dir(d) = &mut self.get_mut(parent)?.kind {
             d.insert(name, ino);
@@ -277,7 +491,12 @@ impl Vfs {
         self.next_ino += 1;
         self.inodes.insert(
             ino.0,
-            Inode { ino, kind: NodeKind::Dir(BTreeMap::new()), mode: 0o755, nlink: 2 },
+            Inode {
+                ino,
+                kind: NodeKind::Dir(BTreeMap::new()),
+                mode: 0o755,
+                nlink: 2,
+            },
         );
         if let NodeKind::Dir(d) = &mut self.get_mut(parent)?.kind {
             d.insert(name, ino);
@@ -402,6 +621,23 @@ impl Vfs {
         Ok(data.len())
     }
 
+    /// Creates `path` or replaces its contents entirely.
+    ///
+    /// `create` alone fails with `EEXIST` on a second call, which is correct
+    /// for `open(O_CREAT|O_EXCL)` but wrong for "write this file". The
+    /// persistence layer and the shell's redirection both want the latter.
+    pub fn put(&mut self, path: &str, data: &[u8]) -> VfsResult<Ino> {
+        if let Ok(ino) = self.lookup(path) {
+            if self.get(ino)?.kind.is_dir() {
+                return Err(Errno::IsDir);
+            }
+            let node = self.get_mut(ino)?;
+            node.kind = NodeKind::File(data.to_vec());
+            return Ok(ino);
+        }
+        self.create(path, data)
+    }
+
     /// Truncates a file to `len`.
     pub fn truncate(&mut self, ino: Ino, len: u64) -> VfsResult<()> {
         let node = self.get_mut(ino)?;
@@ -441,7 +677,148 @@ impl Vfs {
 
     /// Total bytes held in regular files.
     pub fn total_bytes(&self) -> u64 {
-        self.inodes.values().filter(|i| i.kind.is_file()).map(|i| i.kind.size()).sum()
+        self.inodes
+            .values()
+            .filter(|i| i.kind.is_file())
+            .map(|i| i.kind.size())
+            .sum()
+    }
+}
+
+/// Tests for the metadata and path helpers.
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use crate::clock::Timespec;
+
+    fn now() -> Timespec {
+        Timespec::new(1_700_000_000, 123)
+    }
+
+    #[test]
+    fn put_replaces_existing_contents_and_creates_when_missing() {
+        let mut f = Vfs::new();
+        f.put("/a", b"one").unwrap();
+        f.put("/a", b"two").unwrap();
+        assert_eq!(f.contents(f.lookup("/a").unwrap()), b"two");
+        // Replacing must not leave the old bytes behind.
+        f.put("/a", b"x").unwrap();
+        assert_eq!(f.contents(f.lookup("/a").unwrap()), b"x");
+    }
+
+    #[test]
+    fn put_refuses_to_clobber_a_directory() {
+        let mut f = Vfs::new();
+        f.mkdir("/d").unwrap();
+        assert_eq!(f.put("/d", b"x"), Err(Errno::IsDir));
+    }
+
+    #[test]
+    fn put_creates_missing_parent_free_paths_only() {
+        let mut f = Vfs::new();
+        assert_eq!(f.put("/missing/file", b"x"), Err(Errno::NoEnt));
+    }
+
+    #[test]
+    fn contents_of_a_directory_is_empty_rather_than_an_error() {
+        let mut f = Vfs::new();
+        f.mkdir("/d").unwrap();
+        assert!(f.contents(f.lookup("/d").unwrap()).is_empty());
+        assert!(f.contents(Ino(9999)).is_empty());
+    }
+
+    #[test]
+    fn path_of_recovers_the_full_path() {
+        let mut f = Vfs::new();
+        f.mkdir("/a").unwrap();
+        f.mkdir("/a/b").unwrap();
+        f.create("/a/b/c", b"x").unwrap();
+        assert_eq!(f.path_of(f.lookup("/a/b/c").unwrap()), "/a/b/c");
+        assert_eq!(f.path_of(f.lookup("/a/b").unwrap()), "/a/b");
+        assert_eq!(f.path_of(f.lookup("/a").unwrap()), "/a");
+        assert_eq!(f.path_of(Ino(1)), "/");
+    }
+
+    #[test]
+    fn path_of_unknown_inodes_is_root_not_a_panic() {
+        let f = Vfs::new();
+        assert_eq!(f.path_of(Ino(4242)), "/");
+        assert_eq!(f.path_of(Ino(0)), "/");
+    }
+
+    #[test]
+    fn stat_reports_file_type_and_size() {
+        let mut f = Vfs::new();
+        f.mkdir("/d").unwrap();
+        let file = f.create("/f", b"hello").unwrap();
+        let st = f.stat(file, now()).unwrap();
+        assert!(st.is_file());
+        assert!(!st.is_dir());
+        assert_eq!(st.size, 5);
+        assert_eq!(st.ino, file.0);
+        assert_eq!(st.blksize, 4096);
+        assert_eq!(st.blocks, 1);
+    }
+
+    #[test]
+    fn stat_reports_directories_with_the_right_type_and_link_count() {
+        let f = Vfs::new();
+        let st = f.stat(Ino(1), now()).unwrap();
+        assert!(st.is_dir());
+        assert_eq!(st.nlink, 2);
+        assert_eq!(st.mode & 0o777, 0o755);
+    }
+
+    #[test]
+    fn stat_of_a_missing_inode_is_badf() {
+        let f = Vfs::new();
+        assert_eq!(f.stat(Ino(777), now()), Err(Errno::Badf));
+    }
+
+    #[test]
+    fn stat_carries_the_supplied_timestamp_into_all_three_fields() {
+        let mut f = Vfs::new();
+        let ino = f.create("/f", b"x").unwrap();
+        let st = f.stat(ino, now()).unwrap();
+        assert_eq!(st.mtime_sec, 1_700_000_000);
+        assert_eq!(st.mtime_nsec, 123);
+        assert_eq!(st.atime_sec, st.mtime_sec);
+        assert_eq!(st.ctime_sec, st.mtime_sec);
+    }
+
+    #[test]
+    fn stat_bytes_round_trip_through_the_linux_layout() {
+        let mut f = Vfs::new();
+        let ino = f.create("/f", b"payload").unwrap();
+        let st = f.stat(ino, now()).unwrap();
+        let bytes = st.to_bytes();
+        assert_eq!(bytes.len(), Stat::BYTE_LEN);
+        assert_eq!(Stat::from_bytes(&bytes), Some(st));
+    }
+
+    #[test]
+    fn stat_from_bytes_rejects_a_short_buffer() {
+        assert_eq!(Stat::from_bytes(&[0u8; 8]), None);
+        assert_eq!(Stat::from_bytes(&[0u8; Stat::BYTE_LEN - 1]), None);
+        assert!(Stat::from_bytes(&[0u8; Stat::BYTE_LEN]).is_some());
+    }
+
+    #[test]
+    fn an_empty_file_reports_zero_size_but_still_allocates_a_block() {
+        let mut f = Vfs::new();
+        let ino = f.create("/empty", b"").unwrap();
+        let st = f.stat(ino, now()).unwrap();
+        assert_eq!(st.size, 0);
+        assert_eq!(st.blocks, 0);
+    }
+
+    #[test]
+    fn nodes_lists_every_inode() {
+        let mut f = Vfs::new();
+        f.mkdir("/d").unwrap();
+        f.create("/d/f", b"x").unwrap();
+        assert_eq!(f.nodes().len(), f.inode_count());
+        assert_eq!(f.nodes().len(), 3);
     }
 }
 
@@ -555,7 +932,10 @@ mod tests {
         f.create("/usr/bin/tool", b"bin").unwrap();
 
         assert!(f.get(f.lookup("/usr/bin").unwrap()).unwrap().kind.is_dir());
-        assert_eq!(f.read(f.lookup("/usr/bin/tool").unwrap(), 0, 3).unwrap(), b"bin".to_vec());
+        assert_eq!(
+            f.read(f.lookup("/usr/bin/tool").unwrap(), 0, 3).unwrap(),
+            b"bin".to_vec()
+        );
         // Parent link counts: root 2, /usr 3.
         assert_eq!(f.get(f.lookup("/usr").unwrap()).unwrap().nlink, 3);
     }
@@ -673,7 +1053,10 @@ mod tests {
         assert_eq!(f.write(ino, 8, b"Z").unwrap(), 1);
         let got = f.read(ino, 0, 9).unwrap();
         assert_eq!(&got[..3], b"abc");
-        assert!(got[3..8].iter().all(|b| *b == 0), "gap must be zeroed: {got:?}");
+        assert!(
+            got[3..8].iter().all(|b| *b == 0),
+            "gap must be zeroed: {got:?}"
+        );
         assert_eq!(got[8], b'Z');
     }
 
@@ -749,7 +1132,10 @@ mod tests {
         f.mkdir("/a/b/c/d").unwrap();
         f.create("/a/b/c/d/leaf", b"deep").unwrap();
 
-        assert_eq!(f.read(f.lookup("/a/b/c/d/leaf").unwrap(), 0, 4).unwrap(), b"deep".to_vec());
+        assert_eq!(
+            f.read(f.lookup("/a/b/c/d/leaf").unwrap(), 0, 4).unwrap(),
+            b"deep".to_vec()
+        );
         // Clean teardown in reverse order.
         f.unlink("/a/b/c/d/leaf").unwrap();
         f.rmdir("/a/b/c/d").unwrap();

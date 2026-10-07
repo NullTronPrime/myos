@@ -8,7 +8,10 @@
 //! Everything here is host-facing and unsafe; the parsing and validation it
 //! relies on lives in `oscore::elf` and is unit-tested.
 
-use libc::{c_void, MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use libc::{
+    c_void, MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, PROT_EXEC,
+    PROT_READ, PROT_WRITE,
+};
 use oscore::addr::{align_down, align_up, PAGE_SIZE};
 use oscore::elf::class::Type;
 use oscore::elf::ElfImage;
@@ -114,7 +117,12 @@ pub fn prepare(
         .image_span()
         .ok_or_else(|| "image has no loadable segments".to_string())?;
     let brk = align_up(base + hi).ok_or_else(|| "image end overflowed".to_string())?;
-    Ok(Loaded { entry: start, stack_top, brk, at_base })
+    Ok(Loaded {
+        entry: start,
+        stack_top,
+        brk,
+        at_base,
+    })
 }
 
 /// A dynamic linker, mapped and ready to run.
@@ -154,8 +162,8 @@ fn load_interpreter(image: &ElfImage, bytes: &[u8]) -> Result<Option<Interpreter
     let path = std::str::from_utf8(&raw[..nul])
         .map_err(|_| "PT_INTERP path is not valid UTF-8".to_string())?;
 
-    let interp_bytes = std::fs::read(path)
-        .map_err(|e| format!("cannot read the dynamic linker {path}: {e}"))?;
+    let interp_bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read the dynamic linker {path}: {e}"))?;
     let img = ElfImage::parse(&interp_bytes)
         .map_err(|e| format!("dynamic linker {path} is not a valid ELF: {}", e.as_str()))?;
     if img.header.etype != Type::SharedObject {
@@ -309,8 +317,12 @@ fn ensure_unmapped(
     let maps = std::fs::read_to_string("/proc/self/maps")
         .map_err(|e| format!("cannot read /proc/self/maps: {e}"))?;
     for line in maps.lines() {
-        let Some(range) = line.split_whitespace().next() else { continue };
-        let Some((s, e)) = range.split_once('-') else { continue };
+        let Some(range) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Some((s, e)) = range.split_once('-') else {
+            continue;
+        };
         let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) else {
             continue;
         };
@@ -399,17 +411,31 @@ struct StackLayout {
 /// ever inserted between `argc` and `argv[0]`. `auxv_entries` counts every
 /// `(tag, value)` pair including the terminating `AT_NULL`.
 fn plan_stack(argv: &[CString], envp: &[CString], auxv_entries: usize) -> StackLayout {
-    let raw = argv.iter().map(|a| a.as_bytes_with_nul().len()).sum::<usize>()
-        + envp.iter().map(|e| e.as_bytes_with_nul().len()).sum::<usize>()
+    let raw = argv
+        .iter()
+        .map(|a| a.as_bytes_with_nul().len())
+        .sum::<usize>()
+        + envp
+            .iter()
+            .map(|e| e.as_bytes_with_nul().len())
+            .sum::<usize>()
         + AT_RANDOM_BYTES.len()
         + AT_PLATFORM_STR.len();
     let strings_bytes = (raw + 7) & !7;
     let arrays_bytes = 8               // argc
         + 8 * (argv.len() + 1)         // argv and its NULL
         + 8 * (envp.len() + 1)         // envp and its NULL
-        + 16 * auxv_entries;           // auxv, ending in AT_NULL
-    let pad = if (strings_bytes + arrays_bytes) % 16 == 0 { 0 } else { 8 };
-    StackLayout { strings_bytes, arrays_bytes, pad }
+        + 16 * auxv_entries; // auxv, ending in AT_NULL
+    let pad = if (strings_bytes + arrays_bytes) % 16 == 0 {
+        0
+    } else {
+        8
+    };
+    StackLayout {
+        strings_bytes,
+        arrays_bytes,
+        pad,
+    }
 }
 
 /// Builds the System V initial stack: `argc`, `argv`, `envp`, then `auxv`.
@@ -534,7 +560,8 @@ fn build_stack(
 
     // The plan put `rsp` exactly `strings_bytes + arrays_bytes` below the pad
     // that was reserved at the top. Check it rather than trusting the pushes.
-    let planned = stack_top - layout.pad as u64 - layout.strings_bytes as u64 - layout.arrays_bytes as u64;
+    let planned =
+        stack_top - layout.pad as u64 - layout.strings_bytes as u64 - layout.arrays_bytes as u64;
     assert_eq!(sp, planned, "initial stack did not match its plan");
 
     Ok(sp)
@@ -543,7 +570,11 @@ fn build_stack(
 /// Address of the program header table once the image is mapped.
 fn phdr_addr(image: &ElfImage, base: u64) -> Option<u64> {
     let e_phoff = image.header.phoff;
-    for ph in image.segments.iter().filter(|p| p.is_load() && p.filesz > 0) {
+    for ph in image
+        .segments
+        .iter()
+        .filter(|p| p.is_load() && p.filesz > 0)
+    {
         if e_phoff >= ph.offset && e_phoff < ph.offset + ph.filesz {
             return Some(base + ph.vaddr + (e_phoff - ph.offset));
         }

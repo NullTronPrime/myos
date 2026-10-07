@@ -7,11 +7,11 @@ from Rust. It is parasitic by design — it borrows a Linux process the way a
 library OS borrows its host.
 
 ```
-crates/oscore   pure, host-testable core (no unsafe): address space, frames,
+crates/oscore   host-testable core :implements address space, frames,
                 memory, VFS, ELF, relocation, graphics, syscall dispatcher
-crates/osplat   the only Linux-specific layer: ELF loader, SIGSYS trap handler,
+crates/osplat   Linux specific layer:implements ELF loader, SIGSYS trap handler,
                 host process/pipe/fd plumbing
-crates/myos     the launcher binary (`myos`)
+crates/myos     the launcher binary
 guest/          guest programs and the self-hosted C library (`minic`)
 scripts/        build and run helpers
 ```
@@ -19,7 +19,7 @@ scripts/        build and run helpers
 ## How it works
 
 - **Hosted kernel.** `myos` maps the guest image (optionally followed by the
-  host's own `ld.so` for dynamic guests), builds a SysV initial stack, and jumps
+  host's own `ld.so` for dynamic guests), builds a SysV initial stack, and transfers
   to the entry point in a forked child.
 - **Seccomp + SIGSYS.** A seccomp filter traps syscalls. Calls issued from guest
   code (below 4 GiB) are serviced by `oscore`; calls issued by host libraries
@@ -40,7 +40,7 @@ scripts/        build and run helpers
 ## Build and run
 
 ```sh
-scripts/build.sh      # builds the kernel + guests, assembles target/rootfs
+scripts/build.sh      # builds the kernel + guests+ assembles target/rootfs
 scripts/run.sh        # opens the myos shell
 ```
 
@@ -92,8 +92,7 @@ gcc -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
 
 ## Tests
 
-`guest/contracts.sh` pins the kernel/host behaviours the OS depends on and runs
-the end-to-end checks:
+`guest/contracts.sh` just a really large check
 
 ```sh
 bash guest/contracts.sh

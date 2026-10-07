@@ -82,7 +82,10 @@ pub const fn is_canonical(addr: u64) -> bool {
 
 /// Splits a virtual address into its page-aligned base and page offset.
 pub const fn split_page(addr: u64) -> (u64, u16) {
-    (addr & !((PAGE_SIZE as u64) - 1), (addr & ((PAGE_SIZE as u64) - 1)) as u16)
+    (
+        addr & !((PAGE_SIZE as u64) - 1),
+        (addr & ((PAGE_SIZE as u64) - 1)) as u16,
+    )
 }
 
 /// Page-aligns `addr` downwards.
@@ -185,9 +188,21 @@ impl Perms {
 /// Formats the permission bits the way `/proc/self/maps` does.
 pub fn format_perms(perms: Perms) -> String {
     let mut s = String::with_capacity(4);
-    s.push(if perms.contains(Perms::READ) { 'r' } else { '-' });
-    s.push(if perms.contains(Perms::WRITE) { 'w' } else { '-' });
-    s.push(if perms.contains(Perms::EXEC) { 'x' } else { '-' });
+    s.push(if perms.contains(Perms::READ) {
+        'r'
+    } else {
+        '-'
+    });
+    s.push(if perms.contains(Perms::WRITE) {
+        'w'
+    } else {
+        '-'
+    });
+    s.push(if perms.contains(Perms::EXEC) {
+        'x'
+    } else {
+        '-'
+    });
     s
 }
 
@@ -282,7 +297,10 @@ mod tests {
         // Composite permissions must equal the union of their parts, or
         // `contains` silently fails for anything built from RW.
         assert_eq!(Perms::READ.union(Perms::WRITE), Perms::RW);
-        assert_eq!(Perms::READ.union(Perms::WRITE).union(Perms::EXEC), Perms::RWX);
+        assert_eq!(
+            Perms::READ.union(Perms::WRITE).union(Perms::EXEC),
+            Perms::RWX
+        );
         assert_eq!(format_perms(Perms::RWX), "rwx");
         assert_eq!(format_perms(Perms::READ), "r--");
         assert_eq!(format_perms(Perms::NONE), "---");

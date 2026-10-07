@@ -35,7 +35,8 @@ use libc::{c_char, c_int, c_void, sigaction, siginfo_t, ucontext_t};
 use oscore::syscall::{
     dispatch, FdKind, FdTable, GuestMemory, GuestState, Registers, MAP_ANONYMOUS, MAP_FIXED,
     PROT_READ, PROT_WRITE, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE,
-    SYS_FORK, SYS_GETPID, SYS_IOCTL, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_WAIT4, SYS_WRITE,
+    SYS_FORK, SYS_GETPID, SYS_IOCTL, SYS_KILL, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RT_SIGRETURN,
+    SYS_SYNC_FS, SYS_WAIT4, SYS_WRITE,
 };
 use oscore::vfs::{Fd, Vfs};
 use std::ffi::CString;
@@ -134,8 +135,18 @@ pub fn build_filter(allow: &[i64]) -> Vec<libc::sock_filter> {
             k: nr as u32,
         });
     }
-    prog.push(libc::sock_filter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_TRAP });
-    prog.push(libc::sock_filter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW });
+    prog.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_TRAP,
+    });
+    prog.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    });
     prog
 }
 
@@ -160,8 +171,6 @@ pub struct TrapState {
     pub mapped_brk: u64,
     /// Fake pid, incremented per `getpid`.
     pub pid: i64,
-    /// Per-inode read/write offsets, so files behave like real descriptors.
-    pub file_pos: std::collections::BTreeMap<u64, u64>,
     /// `%fs` base the guest wants while its code runs. Starts equal to the
     /// host's own base, so a guest that never calls `arch_prctl` is unaffected.
     pub guest_fs: u64,
@@ -169,6 +178,26 @@ pub struct TrapState {
     pub display: oscore::gfx::Display,
     /// PPM bytes produced by the last `display_present`, drained by the handler.
     pub frame: Vec<u8>,
+    /// Wall and monotonic time, refreshed from the host before every trap so a
+    /// guest's clock moves even when it makes no syscalls of its own.
+    pub clock: oscore::clock::Clock,
+    /// Whether `clock` has been seeded with a host reading yet.
+    pub clock_started: bool,
+    /// Signal dispositions, blocked mask and pending queue.
+    pub signals: oscore::signal::SignalTable,
+    /// Keyboard and mouse events waiting for the guest.
+    pub input: oscore::input::InputQueue,
+    /// The guest's working directory, used to resolve relative paths.
+    pub cwd: String,
+    /// The guest's file mode creation mask.
+    pub umask: u32,
+    /// Frames composited so far, so a guest loop can pace itself.
+    pub frame_counter: u64,
+    /// Set while the guest is parked in `input_wait`.
+    pub waiting_for_input: bool,
+    /// The descriptor input events are read from, carried between traps so a
+    /// guest that asks on every frame does not leak one per frame.
+    pub input_fd: Option<u32>,
 }
 
 impl TrapState {
@@ -181,10 +210,136 @@ impl TrapState {
             brk: 0,
             mapped_brk: 0,
             pid: 0,
-            file_pos: std::collections::BTreeMap::new(),
             guest_fs: 0,
             display: oscore::gfx::Display::new(display_width(), display_height()),
             frame: Vec::new(),
+            clock: oscore::clock::Clock::default(),
+            clock_started: false,
+            signals: oscore::signal::SignalTable::new(),
+            input: oscore::input::InputQueue::new(),
+            cwd: "/".to_string(),
+            umask: 0o022,
+            frame_counter: 0,
+            waiting_for_input: false,
+            input_fd: None,
+        }
+    }
+}
+
+/// Nanoseconds from the host for the named clock.
+///
+/// A failure leaves the clock at zero rather than aborting: a guest that only
+/// wants a non-decreasing sequence is better served by a frozen clock than by a
+/// kernel that will not start.
+fn host_clock_ns(id: libc::clockid_t) -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(id, &mut ts) } != 0 {
+        return 0;
+    }
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// Blocks the host thread until the monotonic clock reaches `deadline_ns`.
+///
+/// The wait is chunked rather than handed to `clock_nanosleep` in one call so
+/// that input arriving in the meantime is picked up; a guest that sleeps for an
+/// hour must still see the mouse move.
+fn sleep_until(deadline_ns: u64) {
+    loop {
+        let now = host_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64;
+        if now >= deadline_ns {
+            return;
+        }
+        let remaining = deadline_ns - now;
+        // Cap each nap so input is polled at a reasonable rate.
+        let chunk = remaining.min(50_000_000);
+        let ts = libc::timespec {
+            tv_sec: (chunk / 1_000_000_000) as libc::time_t,
+            tv_nsec: (chunk % 1_000_000_000) as i64,
+        };
+        // `CLOCK_MONOTONIC` is a high-address syscall the filter allows, so this
+        // does not re-enter the guest trap path.
+        unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut()) };
+        pump_input();
+    }
+}
+
+/// Pumps host input until something arrives or the deadline passes.
+fn wait_for_input(deadline_ns: u64) {
+    loop {
+        pump_input();
+        let have = match state().lock() {
+            Ok(g) => !g.input.is_empty(),
+            Err(p) => !p.into_inner().input.is_empty(),
+        };
+        if have {
+            return;
+        }
+        let now = host_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64;
+        if now >= deadline_ns {
+            return;
+        }
+        let chunk = deadline_ns.saturating_sub(now).min(16_000_000);
+        let ts = libc::timespec {
+            tv_sec: (chunk / 1_000_000_000) as libc::time_t,
+            tv_nsec: (chunk % 1_000_000_000) as i64,
+        };
+        unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut()) };
+    }
+}
+
+/// Moves any host window-system events into the guest's input queue.
+///
+/// A guest that never opens a window gets nothing, so the pump is a no-op until
+/// one exists; that keeps a console-only run free of any display dependency.
+fn pump_input() {
+    let events = crate::display::poll_events();
+    if events.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = state().lock() {
+        for e in events {
+            g.input.push(e);
+        }
+    }
+}
+
+/// Forgets a sleep request once it has been served, so a later trap does not
+/// repeat it.
+fn clear_sleep() {
+    if let Ok(mut g) = state().lock() {
+        g.waiting_for_input = false;
+    }
+}
+
+/// Rewinds the instruction pointer to the `syscall` that trapped.
+///
+/// The kernel has already advanced `rip` past the instruction, so a syscall that
+/// needs to run again has to be stepped back over. Subtracting two bytes is the
+/// size of `syscall` on x86-64 and nothing else can produce that trap here.
+fn rewind(uc: &mut libc::ucontext_t) {
+    unsafe {
+        let p = &mut uc.uc_mcontext.gregs[libc::REG_RIP as usize] as *mut i64;
+        *p -= 2;
+    }
+}
+
+/// Writes the guest's filesystem out to its host directory.
+///
+/// Called when the guest asks for a `sync` and again before the process exits,
+/// so a guest that never syncs explicitly still finds its files on disk next
+/// time.
+pub fn sync_filesystem() -> Option<oscore::persist::SyncStats> {
+    let root = ROOT.get()?;
+    let g = state().lock().unwrap_or_else(|p| p.into_inner());
+    match oscore::persist::write_all(&g.vfs, root) {
+        Ok(stats) => Some(stats),
+        Err(e) => {
+            eprintln!("myos: filesystem sync failed: {e}");
+            None
         }
     }
 }
@@ -335,11 +490,17 @@ fn write_hex(buf: &mut [u8], v: u64) -> usize {
     n
 }
 
-/// Reports the first fatal guest fault, then exits.
+/// Turns the first fatal guest fault into a guest signal, then reports if none
+/// was handled.
 ///
 /// Without this the launcher just dies with a signal and gives no clue where.
 /// The fault address and instruction pointer say whether the guest jumped to a
-/// bad address or touched unmapped memory.
+/// bad address or touched unmapped memory, and that report is kept because it is
+/// the only evidence available when the guest has no handler for the fault.
+///
+/// A guest that *has* installed a handler gets it: the frame is built on the
+/// guest's own stack and the context is rewritten so the guest resumes inside
+/// the handler, exactly as it would on a real system.
 extern "C" fn fault_handler(sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
     let mut cur_fs: u64 = 0;
     unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1003u64, &mut cur_fs as *mut u64) };
@@ -348,9 +509,13 @@ extern "C" fn fault_handler(sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
         unsafe { set_fs(kfs) };
     }
     if !info.is_null() && !uc.is_null() {
-        let info = unsafe { &*info };
+        let addr = unsafe { (*info).si_addr() } as u64;
+        // The guest's handler goes first: if one is installed, the guest is
+        // about to resume and must not be killed underneath it.
+        if deliver_fault(sig, addr, unsafe { &mut *(uc as *mut ucontext_t) }) {
+            return;
+        }
         let uc = unsafe { &*(uc as *const ucontext_t) };
-        let addr = unsafe { info.si_addr() } as u64;
         let rip = regs::instruction_pointer(uc);
         let rsp = regs::registers_from(uc).rsp;
         let retaddr = if rsp > 0x1000 && rsp < 0x0000_8000_0000_0000 {
@@ -410,13 +575,39 @@ extern "C" fn fault_handler(sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
             n += 1;
         }
         n += write_hex(&mut buf[n..], cur_fs);
+        // The guest runs natively, so the bytes at the reported `rip` are
+        // readable here. When `rip` is the guest's that names the instruction; a
+        // `#GP` on the way back out of a handler reports the address it was
+        // trying to reach instead, which is how that shows up.
+        for &b in b" insn=" {
+            buf[n] = b;
+            n += 1;
+        }
+        if rip > 0x1000 && rip < 0x0000_8000_0000_0000 {
+            for i in 0..8 {
+                let byte = unsafe { *((rip + i) as *const u8) };
+                buf[n] = b"0123456789abcdef"[(byte >> 4) as usize];
+                n += 1;
+                buf[n] = b"0123456789abcdef"[(byte & 0xf) as usize];
+                n += 1;
+            }
+        } else {
+            for _ in 0..16 {
+                buf[n] = b'-';
+                n += 1;
+            }
+        }
         for &b in b" tcache=" {
             buf[n] = b;
             n += 1;
         }
         n += write_hex(&mut buf[n..], tcache);
-        let labels: [(&[u8], u64); 4] =
-            [(b" w0=", w0), (b" w8=", w8), (b" wm8=", wm8), (b" wm48=", wm48)];
+        let labels: [(&[u8], u64); 4] = [
+            (b" w0=", w0),
+            (b" w8=", w8),
+            (b" wm8=", wm8),
+            (b" wm48=", wm48),
+        ];
         for &(label, val) in &labels {
             for &b in label {
                 buf[n] = b;
@@ -490,6 +681,37 @@ extern "C" fn fault_handler(sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
         }
     }
     unsafe { libc::_exit(128 + sig) };
+}
+
+/// Restores the host's `%fs` base, then queues the fault for the guest and
+/// delivers it if the guest is listening.
+///
+/// Returns `true` when the guest has been sent into its own handler, in which
+/// case this function must return rather than exit so the rewritten context is
+/// restored.
+fn deliver_fault(sig: c_int, addr: u64, uc: &mut ucontext_t) -> bool {
+    let kfs = KERNEL_FS.load(Ordering::SeqCst);
+    if kfs != 0 {
+        unsafe { set_fs(kfs) };
+    }
+    let Some(pending) = crate::signal::fault_pending(sig, addr) else {
+        return false;
+    };
+    let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+    st.signals.queue(pending);
+    let delivered = matches!(
+        crate::signal::deliver(&mut st.signals, uc),
+        crate::signal::Delivered::Went(_)
+    );
+    // The guest's `%fs` base is read while the lock is held and switched back
+    // after it is dropped: the guest resumes on its own stack immediately after
+    // this returns, and anything that touched TLS in between would fault.
+    let gfs = st.guest_fs;
+    drop(st);
+    if delivered && gfs != 0 && gfs != kfs {
+        unsafe { set_fs(gfs) };
+    }
+    delivered
 }
 
 fn state() -> &'static Mutex<TrapState> {
@@ -864,6 +1086,52 @@ fn host_fd_of(fd: u32) -> Option<i32> {
 /// also means the trap state lock is never held across `fork`.
 fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
     match regs_in.nr {
+        // Returning from a handler restores the guest from the frame it was
+        // given. This is not a normal syscall: it must run even while the
+        // signal that caused the handler is still blocked, and it rewrites the
+        // instruction pointer and stack rather than just `rax`.
+        SYS_RT_SIGRETURN => {
+            // The handler returned with `ret`, which already popped `pretcode`
+            // from the top of the frame, so the frame itself is one word below
+            // the stack pointer the guest arrives with. The kernel makes the
+            // same adjustment.
+            let sp = regs_in.rsp.wrapping_sub(8);
+            let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+            let restored = crate::signal::sigreturn(uc, sp, &mut st.signals);
+            drop(st);
+            if !restored {
+                // A handler that cannot return has left nothing sensible to
+                // resume, so the guest ends here rather than running on.
+                eprintln!("myos: rt_sigreturn could not restore the signal frame");
+                unsafe { libc::_exit(139) };
+            }
+            true
+        }
+        // `kill` is the guest's own way of raising a signal. Only the guest
+        // itself is addressable: there is one guest per host process, so a pid
+        // of 0 or our own pid means "me" and anything else is `ESRCH`.
+        SYS_KILL => {
+            let pid = regs_in.arg(0) as i32;
+            let signum = regs_in.arg(1) as i32;
+            if signum < 1 || signum > 64 {
+                regs::set_return(uc, -(libc::EINVAL as i64));
+                return true;
+            }
+            let me = unsafe { libc::getpid() } as i32;
+            if pid != 0 && pid != me {
+                regs::set_return(uc, -(libc::ESRCH as i64));
+                return true;
+            }
+            let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+            st.signals.queue(oscore::signal::Pending::kernel(
+                signum,
+                oscore::signal::SI_USER,
+                0,
+            ));
+            drop(st);
+            regs::set_return(uc, 0);
+            true
+        }
         // glibc's `fork` issues a fork-like `clone` (no new stack) rather than
         // the legacy `fork` syscall, so both are serviced the same way.
         SYS_CLONE if regs_in.arg(1) == 0 => {
@@ -966,6 +1234,12 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
                     return true;
                 }
             };
+            // Only host-backed descriptors need the host to duplicate them. A
+            // VFS file or an input stream is handled by the dispatcher, which
+            // knows how to share an open file description properly.
+            if !matches!(kind, FdKind::Host(_)) {
+                return false;
+            }
             if regs_in.nr == SYS_DUP {
                 // `dup` returns the lowest free guest descriptor.
                 let dup = match kind {
@@ -978,6 +1252,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
                         FdKind::Host(n)
                     }
                     FdKind::File(_) => kind,
+                    _ => unreachable!("only host descriptors reach this arm"),
                 };
                 let fd = {
                     let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
@@ -1001,24 +1276,30 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
                         regs::set_return(uc, new as i64);
                     }
                 }
-                FdKind::File(ino) => {
-                    let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
-                    g.fds.set(Fd(new), FdKind::File(ino));
-                    regs::set_return(uc, new as i64);
+                // Unreachable: host descriptors are filtered out above.
+                _ => {
+                    regs::set_return(uc, -(libc::EBADF as i64));
                 }
             }
             true
         }
         SYS_PIPE | SYS_PIPE2 => {
             let mut pipe_fds = [0i32; 2];
-            let flags = if regs_in.nr == SYS_PIPE2 { regs_in.arg(1) as c_int } else { 0 };
+            let flags = if regs_in.nr == SYS_PIPE2 {
+                regs_in.arg(1) as c_int
+            } else {
+                0
+            };
             if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), flags) } < 0 {
                 regs::set_return(uc, -last_errno());
                 return true;
             }
             let (rd, wr) = {
                 let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
-                (g.fds.alloc_host(pipe_fds[0]).0, g.fds.alloc_host(pipe_fds[1]).0)
+                (
+                    g.fds.alloc_host(pipe_fds[0]).0,
+                    g.fds.alloc_host(pipe_fds[1]).0,
+                )
             };
             let ptr = regs_in.arg(0);
             unsafe {
@@ -1092,11 +1373,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
 ///
 /// Runs on the guest's stack. Takes the global lock, runs the pure dispatcher,
 /// and writes the result back into the saved `rax`.
-extern "C" fn sigsys_handler(
-    _sig: c_int,
-    info: *mut siginfo_t,
-    uc: *mut c_void,
-) {
+extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
     if info.is_null() || uc.is_null() {
         return;
     }
@@ -1127,6 +1404,10 @@ extern "C" fn sigsys_handler(
     // Process-control and host-fd syscalls are serviced directly, before the
     // dispatcher and without the trap lock.
     if process_syscall(&regs_in, uc) {
+        // A `kill` serviced above queues a signal, and that signal has to be
+        // delivered before the guest resumes: a real kernel delivers it as part
+        // of returning from the `kill` itself, not at some later boundary.
+        deliver_pending(uc);
         // The guest resumes as soon as this handler returns, so hand `%fs` back
         // to it here too; the normal path does this after the dispatcher.
         let gfs = match state().lock() {
@@ -1141,11 +1422,24 @@ extern "C" fn sigsys_handler(
 
     let mut mem = HostMemory;
 
-    let (result, out, present, exit, guest_fs) = {
+    let (result, out, present, exit, guest_fs, sleep, parked) = {
         let mut st = match state().lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+
+        // The clock is refreshed before the syscall runs, not after, so a guest
+        // that reads the time and then sleeps sees the deadline it just read.
+        if !st.clock_started {
+            st.clock = oscore::clock::Clock::new(
+                host_clock_ns(libc::CLOCK_REALTIME),
+                host_clock_ns(libc::CLOCK_MONOTONIC),
+            );
+            st.clock_started = true;
+        } else {
+            st.clock.advance_to(host_clock_ns(libc::CLOCK_MONOTONIC));
+        }
+
         // Destructure so the vfs and fd borrows are provably disjoint; taking
         // both through `st` directly would be a double mutable borrow.
         let TrapState {
@@ -1156,10 +1450,18 @@ extern "C" fn sigsys_handler(
             brk,
             mapped_brk,
             pid,
-            file_pos,
             guest_fs,
             display,
             frame,
+            clock,
+            clock_started: _,
+            signals,
+            input,
+            cwd,
+            umask,
+            frame_counter,
+            waiting_for_input,
+            input_fd,
         } = &mut *st;
         let mut gs = GuestState {
             vfs,
@@ -1168,17 +1470,38 @@ extern "C" fn sigsys_handler(
             pid: *pid,
             pending_mmap: Vec::new(),
             stdout: std::mem::take(stdout),
-            file_pos: std::mem::take(file_pos),
             fs_base: 0,
             fs_set: false,
             display: std::mem::take(display),
             frame: std::mem::take(frame),
+            clock: *clock,
+            signals: std::mem::take(signals),
+            input: std::mem::take(input),
+            cwd: std::mem::take(cwd),
+            umask: *umask,
+            frame_counter: *frame_counter,
+            pending_sleep: None,
+            pending_input_wait: *waiting_for_input,
+            input_fd: *input_fd,
+            sync: None,
         };
+        // A `present` is one composited frame; the counter lets a guest that is
+        // redrawing in a loop keep a steady cadence.
+        if !gs.frame.is_empty() {
+            gs.frame_counter += 1;
+        }
         let r = dispatch(&regs_in, &mut mem, &mut gs, fds);
         *exited = gs.exited;
         *brk = gs.brk;
         *pid = gs.pid;
-        *file_pos = std::mem::take(&mut gs.file_pos);
+        *clock = gs.clock;
+        *signals = std::mem::take(&mut gs.signals);
+        *input = std::mem::take(&mut gs.input);
+        *cwd = std::mem::take(&mut gs.cwd);
+        *umask = gs.umask;
+        *frame_counter = gs.frame_counter;
+        *waiting_for_input = gs.pending_input_wait;
+        *input_fd = gs.input_fd;
         // `arch_prctl(ARCH_SET_FS)` is recorded by the dispatcher but must not
         // take effect until the guest resumes, so carry it out here.
         if gs.fs_set {
@@ -1191,11 +1514,17 @@ extern "C" fn sigsys_handler(
         // start of the range down onto the previous page and wipe whatever is
         // already there (glibc's TLS block, for one).
         if regs_in.nr == SYS_BRK {
-            if let (Some(old), Some(new)) =
-                (oscore::addr::align_up(*mapped_brk), oscore::addr::align_up(gs.brk))
-            {
+            if let (Some(old), Some(new)) = (
+                oscore::addr::align_up(*mapped_brk),
+                oscore::addr::align_up(gs.brk),
+            ) {
                 if new > old {
-                    let _ = mem.map(old, new - old, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_FIXED);
+                    let _ = mem.map(
+                        old,
+                        new - old,
+                        PROT_READ | PROT_WRITE,
+                        MAP_ANONYMOUS | MAP_FIXED,
+                    );
                     *mapped_brk = new;
                 }
             }
@@ -1204,10 +1533,40 @@ extern "C" fn sigsys_handler(
         let present = std::mem::take(&mut gs.frame);
         // Carry the window model back so state survives between traps.
         *display = gs.display;
-        (r, out, present, gs.exited, *guest_fs)
+
+        (
+            r,
+            out,
+            present,
+            gs.exited,
+            *guest_fs,
+            gs.pending_sleep,
+            gs.pending_input_wait,
+        )
     };
 
     trace(regs_in.nr, regs_in.arg(0), regs_in.rip, result);
+
+    // A guest that asked to sleep is served here rather than in the dispatcher,
+    // which has no way to pass the time. The instruction pointer is rewound to
+    // the `syscall` so the guest re-executes it once the wait is over, which is
+    // what makes `nanosleep` restartable and lets an interval timer work.
+    if let Some(sleep) = sleep {
+        if parked {
+            wait_for_input(sleep.deadline_ns);
+        } else {
+            sleep_until(sleep.deadline_ns);
+        }
+        if parked {
+            // The guest parked in `input_wait` and has just been given the
+            // chance to receive events. Re-run the call so it observes them and
+            // returns a real count rather than the placeholder the dispatcher
+            // wrote; this is what makes `input_wait` a wait rather than a poll
+            // that always says "nothing yet".
+            rewind(&mut *uc);
+        }
+        clear_sleep();
+    }
 
     // Forward anything the guest wrote to fd 1. The handler runs from kernel
     // code, so this `write` is a high-address syscall the filter allows.
@@ -1218,10 +1577,26 @@ extern "C" fn sigsys_handler(
     // A composited frame is written out only when `MYOS_FB_OUT` names a file,
     // which is what makes the display observable without a real window.
     if !present.is_empty() {
-        if let Some(path) = FB_OUT.get_or_init(|| std::env::var_os("MYOS_FB_OUT").map(PathBuf::from))
+        if let Some(path) =
+            FB_OUT.get_or_init(|| std::env::var_os("MYOS_FB_OUT").map(PathBuf::from))
         {
             if let Err(e) = std::fs::write(path, &present) {
                 eprintln!("myos: framebuffer -> {}: {e}", path.display());
+            }
+        } else {
+            // With no file configured, push the frame to the real window.
+            crate::display::present(&present);
+        }
+    }
+
+    // An explicit `sync` writes the filesystem out immediately.
+    if regs_in.nr == SYS_SYNC_FS {
+        if let Some(stats) = sync_filesystem() {
+            if TRACE.load(Ordering::Relaxed) {
+                eprintln!(
+                    "myos: sync {} files, {} dirs, {} bytes",
+                    stats.files, stats.dirs, stats.bytes
+                );
             }
         }
     }
@@ -1229,7 +1604,10 @@ extern "C" fn sigsys_handler(
     // `exit` is a mediated syscall: the dispatcher records the status, and the
     // host process is ended here. Returning to the guest after it asked to exit
     // would resume the instruction after `syscall`, which no longer exists.
+    // The filesystem is written out first, because after `_exit` there is no
+    // second chance and a guest that never called `sync` would lose its work.
     if let Some(code) = exit {
+        sync_filesystem();
         unsafe { libc::_exit(code) };
     }
 
@@ -1244,15 +1622,54 @@ extern "C" fn sigsys_handler(
     // fault. Calling this out explicitly keeps it ahead of the `set_fs`.
     drop(out);
     drop(present);
+
+    // The syscall's own result goes in before any signal is delivered. A frame
+    // built now saves `rax` as it stands and `rt_sigreturn` puts it back, so a
+    // result written afterwards would be thrown away and the guest would resume
+    // with whatever `rax` held before the syscall.
+    //
+    // For a seccomp TRAP the kernel has already advanced `rip` past the
+    // `syscall` instruction, so only `rax` needs writing; touching `rip` would
+    // resume in the middle of the next instruction.
+    regs::set_return(uc, ret);
+
+    // A signal raised by this syscall, or left over from a fault, is delivered
+    // now that the guest is at a syscall boundary — the one place it can be
+    // interrupted safely. Delivery rewrites `rip`/`rsp` to enter the handler.
+    if regs_in.nr != SYS_RT_SIGRETURN {
+        deliver_pending(uc);
+    }
+
     // Hand `%fs` back to the guest. This is the last thing that may run before
     // the guest resumes: any TLS access after it would use the guest's base.
     if guest_fs != 0 && guest_fs != kfs {
         unsafe { set_fs(guest_fs) };
     }
-    // For a seccomp TRAP the kernel has already advanced `rip` past the
-    // `syscall` instruction, so only `rax` needs writing; touching `rip` would
-    // resume in the middle of the next instruction.
-    regs::set_return(uc, ret);
+}
+
+/// Hands the guest any signal it is ready to receive.
+///
+/// Called with `%fs` still pointing at the host, because building the frame
+/// allocates. Returns without touching `uc` when there is nothing to deliver,
+/// which is the overwhelmingly common case.
+fn deliver_pending(uc: &mut ucontext_t) {
+    let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+    if st.signals.pending_len() == 0 {
+        return;
+    }
+    match crate::signal::deliver(&mut st.signals, uc) {
+        crate::signal::Delivered::Dropped | crate::signal::Delivered::Undeliverable => {}
+        crate::signal::Delivered::Fatal(signum) => {
+            drop(st);
+            // No handler and a fatal default: end the guest the way the signal
+            // would have, so a shell still sees 128+signum.
+            unsafe { libc::_exit(128 + signum) };
+        }
+        crate::signal::Delivered::Went(_) => {
+            // Nothing more to do: `rax` already holds the syscall's result, and
+            // the frame saved it so `rt_sigreturn` will hand it back.
+        }
+    }
 }
 
 /// Drains anything the guest wrote to stdout.
@@ -1292,31 +1709,13 @@ pub fn provide_dir(path: &str) -> Result<(), oscore::vfs::Errno> {
 
 /// Mirrors a host directory into the guest filesystem.
 ///
-/// The copy is one-way: files are pulled into the in-memory VFS, so a guest
-/// write stays private to its own process and the host tree is never touched.
-/// Returns the number of nodes mirrored.
+/// The direction is chosen by what is already there. A directory that was never
+/// written to is pulled in; one the guest has modified is pushed back out. That
+/// makes the filesystem survive a run without a guest ever calling `sync`, while
+/// still letting a guest change its own tree.
 pub fn preload_root(root: &Path) -> Result<usize, String> {
-    fn walk(vfs: &mut Vfs, host: &Path, guest: &str) -> Result<usize, String> {
-        let mut n = 0;
-        for entry in std::fs::read_dir(host).map_err(|e| format!("{}: {e}", host.display()))? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let ft = entry.file_type().map_err(|e| e.to_string())?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let gpath = if guest == "/" { format!("/{name}") } else { format!("{guest}/{name}") };
-            if ft.is_dir() {
-                vfs.mkdir(&gpath).map_err(|e| format!("mkdir {gpath}: {e:?}"))?;
-                n += 1 + walk(vfs, &entry.path(), &gpath)?;
-            } else if ft.is_file() {
-                let data = std::fs::read(entry.path()).map_err(|e| format!("read {gpath}: {e}"))?;
-                vfs.create(&gpath, &data).map_err(|e| format!("create {gpath}: {e:?}"))?;
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
-
     let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
-    walk(&mut g.vfs, root, "/")
+    oscore::persist::read_all(root, &mut g.vfs)
 }
 
 /// Sets the guest's initial program break, normally the page-aligned end of the

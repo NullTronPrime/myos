@@ -104,6 +104,43 @@ int dup2(int oldfd, int newfd) {
     return (int)syscall(SYS_dup2, oldfd, newfd);
 }
 
+/* Signals. Each of these is serviced by the OS rather than the host, so a guest
+ * built against minic gets the same delivery, blocking and frame semantics as
+ * one built against a real libc -- which is what makes the two comparable. */
+
+int sigaction(int signum, const mysigaction *act, mysigaction *old) {
+    /* A handler returns to `sa_restorer`, which has to issue `rt_sigreturn`, so
+     * an install without one is refused. Rather than make every guest spell it
+     * out, fill in the one this library ships, the way a real libc does. The
+     * caller's copy is left alone because it is const. */
+    mysigaction patched;
+    if (act != 0) {
+        patched = *act;
+        if (patched.handler != SIG_DFL_ && patched.handler != SIG_IGN_ &&
+            patched.restorer == 0) {
+            patched.restorer = (unsigned long)minic_sigreturn;
+        }
+        act = &patched;
+    }
+    /* The trailing argument is the size of the mask, which the kernel's
+     * x86-64 ABI fixes at eight bytes. Passing it is required: the OS reads the
+     * action through it to decide what to install. */
+    return (int)syscall(SYS_rt_sigaction, signum, (long)act, (long)old, 8);
+}
+
+int sigprocmask(int how, const unsigned long *set, unsigned long *old) {
+    return (int)syscall(SYS_rt_sigprocmask, how, (long)set, (long)old, 8);
+}
+
+int kill(pid_t pid, int signo) {
+    return (int)syscall(SYS_kill, pid, signo);
+}
+
+int raise_(int signo) {
+    /* One guest per process, so "me" is always the right pid. */
+    return kill(getpid(), signo);
+}
+
 size_t strlen(const char *s) {
     const char *p = s;
     while (*p) {
