@@ -77,6 +77,42 @@ pub const SYS_FACCESSAT: i64 = 269;
 pub const SYS_PSELECT6: i64 = 270;
 pub const SYS_POLL: i64 = 271;
 pub const SYS_SET_ROBUST_LIST: i64 = 273;
+pub const SYS_EPOLL_CREATE1: i64 = 291;
+pub const SYS_EPOLL_CTL: i64 = 233;
+pub const SYS_EPOLL_WAIT: i64 = 232;
+pub const SYS_EVENTFD2: i64 = 290;
+pub const SYS_FUTEX: i64 = 202;
+pub const SYS_TGKILL_ALREADY: i64 = 234;
+pub const SYS_OPENPT: i64 = 340;
+pub const SYS_GRANTPT: i64 = 341;
+pub const SYS_UNLOCKPT: i64 = 342;
+pub const SYS_PTSNAME: i64 = 343;
+pub const SYS_TCGETATTR: i64 = 344;
+pub const SYS_TCSETATTR: i64 = 345;
+pub const SYS_IOCTL_TIOCSCTTY: i64 = 346;
+pub const SYS_IOCTL_TIOCGWINSZ: i64 = 347;
+pub const SYS_IOCTL_TIOCSWINSZ: i64 = 348;
+pub const SYS_MEMFD_CREATE: i64 = 352;
+pub const SYS_SHM_OPEN: i64 = 353;
+pub const SYS_SHM_UNLINK: i64 = 354;
+pub const SYS_SOCKET: i64 = 41;
+pub const SYS_CONNECT: i64 = 42;
+pub const SYS_ACCEPT: i64 = 43;
+pub const SYS_SENDTO: i64 = 44;
+pub const SYS_RECVFROM: i64 = 45;
+pub const SYS_SENDMSG: i64 = 46;
+pub const SYS_RECVMSG: i64 = 47;
+pub const SYS_SHUTDOWN: i64 = 48;
+pub const SYS_BIND: i64 = 49;
+pub const SYS_LISTEN: i64 = 50;
+pub const SYS_GETSOCKNAME: i64 = 51;
+pub const SYS_GETPEERNAME: i64 = 52;
+pub const SYS_SOCKETPAIR: i64 = 53;
+pub const SYS_SETSOCKOPT: i64 = 54;
+pub const SYS_GETSOCKOPT: i64 = 55;
+pub const SYS_CLONE3: i64 = 435;
+pub const SYS_PRLIMIT64_NEW: i64 = 302;
+pub const SYS_RSEQ_NEW: i64 = 334;
 pub const SYS_UTIMENSAT: i64 = 280;
 pub const SYS_FALLOCATE: i64 = 285;
 pub const SYS_PPOLL: i64 = 288;
@@ -84,7 +120,6 @@ pub const SYS_DUP3: i64 = 292;
 pub const SYS_PIPE2: i64 = 293;
 pub const SYS_PRLIMIT64: i64 = 302;
 pub const SYS_GETRANDOM: i64 = 318;
-pub const SYS_MEMFD_CREATE: i64 = 319;
 pub const SYS_EXECVEAT: i64 = 322;
 pub const SYS_STATX: i64 = 332;
 pub const SYS_RSEQ: i64 = 334;
@@ -134,6 +169,197 @@ pub const SYS_INPUT_FD: i64 = 0x1012;
 /// `arch_prctl` sub-functions for the thread-pointer (`%fs`) base.
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
+
+/// `poll` event flags.
+pub const POLLIN: u16 = 0x001;
+pub const POLLOUT: u16 = 0x004;
+pub const POLLERR: u16 = 0x008;
+pub const POLLHUP: u16 = 0x010;
+pub const POLLNVAL: u16 = 0x020;
+pub const POLLPRI: u16 = 0x002;
+pub const POLLRDNORM: u16 = 0x040;
+pub const POLLWRNORM: u16 = 0x100;
+
+/// `epoll_ctl` operations.
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+/// `epoll` event flags.
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLPRI: u32 = 0x002;
+pub const EPOLLET: u32 = 1 << 31;
+pub const EPOLLONESHOT: u32 = 1 << 30;
+
+/// `epoll_create1` flags.
+pub const EPOLL_CLOEXEC: i32 = 0o2000000;
+
+/// `eventfd2` flags.
+pub const EFD_CLOEXEC: i32 = 0o2000000;
+pub const EFD_NONBLOCK: i32 = 0o4000;
+
+/// `futex` operations.
+pub const FUTEX_WAIT: i32 = 0;
+pub const FUTEX_WAKE: i32 = 1;
+pub const FUTEX_FD: i32 = 2;
+pub const FUTEX_REQUEUE: i32 = 3;
+pub const FUTEX_CMP_REQUEUE: i32 = 4;
+pub const FUTEX_WAKE_OP: i32 = 5;
+pub const FUTEX_LOCK_PI: i32 = 6;
+pub const FUTEX_UNLOCK_PI: i32 = 7;
+pub const FUTEX_TRYLOCK_PI: i32 = 8;
+pub const FUTEX_WAIT_BITSET: i32 = 9;
+pub const FUTEX_WAKE_BITSET: i32 = 10;
+pub const FUTEX_PRIVATE_FLAG: i32 = 128;
+pub const FUTEX_CLOCK_REALTIME: i32 = 256;
+
+/// `struct pollfd` layout: fd (4 bytes), events (2), revents (2).
+pub const POLLFD_SIZE: usize = 8;
+
+/// `struct epoll_event` layout: events (4), data (8).
+pub const EPOLLEV_SIZE: usize = 16;
+
+/// `struct eventfd` counter size.
+pub const EVENTFD_SIZE: usize = 8;
+
+/// An epoll instance: a set of watched fds and their event masks.
+#[derive(Clone, Debug, Default)]
+pub struct EpollInstance {
+    /// Maps guest fd -> event mask being watched.
+    watches: BTreeMap<u32, u32>,
+}
+
+impl EpollInstance {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, fd: u32, events: u32) {
+        self.watches.insert(fd, events);
+    }
+
+    pub fn del(&mut self, fd: u32) {
+        self.watches.remove(&fd);
+    }
+
+    pub fn modify(&mut self, fd: u32, events: u32) {
+        self.watches.insert(fd, events);
+    }
+
+    pub fn contains(&self, fd: u32) -> bool {
+        self.watches.contains_key(&fd)
+    }
+
+    pub fn events(&self, fd: u32) -> Option<u32> {
+        self.watches.get(&fd).copied()
+    }
+
+    pub fn fds(&self) -> Vec<u32> {
+        self.watches.keys().copied().collect()
+    }
+}
+
+/// An eventfd: a counter that is readable when > 0 and writable when < u64::MAX-1.
+#[derive(Clone, Copy, Debug)]
+pub struct EventFd {
+    pub counter: u64,
+    pub nonblock: bool,
+}
+
+impl EventFd {
+    pub fn new(initval: u64, nonblock: bool) -> Self {
+        EventFd {
+            counter: initval,
+            nonblock,
+        }
+    }
+
+    pub fn readable(&self) -> bool {
+        self.counter > 0
+    }
+
+    pub fn writable(&self) -> bool {
+        self.counter < u64::MAX - 1
+    }
+}
+
+/// A futex: a guest address used as a synchronization primitive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Futex {
+    /// The value the futex expects (for WAIT) or the new value (for WAKE).
+    pub expected: u32,
+    /// Whether the futex is currently held.
+    pub held: bool,
+}
+
+/// Checks readiness for a single guest fd.
+///
+/// Returns the revents mask. VFS files are always ready. Host-backed fds
+/// are checked with the host's poll. The input queue is readable when
+/// non-empty. Eventfds follow their counter.
+pub fn poll_fd(
+    fd: Fd,
+    events: u16,
+    fds: &FdTable,
+    input: &crate::input::InputQueue,
+    eventfds: &BTreeMap<u32, EventFd>,
+    poll_host: Option<fn(i32, i16) -> i16>,
+) -> u16 {
+    let mut revents: u16 = 0;
+
+    // Check for errors/hup on unknown fds
+    let kind = match fds.get(fd) {
+        Ok(k) => k,
+        Err(_) => return POLLNVAL,
+    };
+
+    match kind {
+        FdKind::File(_) => {
+            // In-memory VFS files are always ready for read and write.
+            if events & POLLIN != 0 {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+        }
+        FdKind::Host(host_fd) => {
+            if let Some(poll_fn) = poll_host {
+                let r = poll_fn(host_fd, events as i16);
+                if r < 0 {
+                    revents |= POLLERR;
+                } else {
+                    revents |= r as u16;
+                }
+            }
+        }
+        FdKind::Input => {
+            if events & POLLIN != 0 && !input.is_empty() {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+        }
+    }
+
+    // Eventfd readiness
+    if let Some(efd) = eventfds.get(&fd.0) {
+        if events & POLLIN != 0 && efd.readable() {
+            revents |= POLLIN;
+        }
+        if events & POLLOUT != 0 && efd.writable() {
+            revents |= POLLOUT;
+        }
+    }
+
+    revents
+}
+
+
 
 /// `lseek` whence values.
 pub const SEEK_SET: i64 = 0;
@@ -272,6 +498,29 @@ pub struct GuestState<'a> {
     pub input_fd: Option<u32>,
     /// Statistics the platform should report after a `sync`.
     pub sync: Option<crate::persist::SyncStats>,
+    /// Epoll instances, keyed by guest fd.
+    pub epolls: BTreeMap<u32, EpollInstance>,
+    /// Eventfds, keyed by guest fd.
+    pub eventfds: BTreeMap<u32, EventFd>,
+    /// Futex table: guest address -> futex state.
+    pub futexes: BTreeMap<u64, Futex>,
+    /// Platform-provided poll function for host-backed fds.
+    /// Takes (host_fd, events) and returns revents or -1 on error.
+    pub poll_host: Option<fn(i32, i16) -> i16>,
+    /// Platform-provided pty functions.
+    pub pty_open: Option<fn() -> i32>,
+    pub pty_grant: Option<fn(i32) -> i32>,
+    pub pty_unlock: Option<fn(i32) -> i32>,
+    pub pty_name: Option<fn(i32) -> String>,
+    pub pty_getattr: Option<fn(i32) -> Vec<u8>>,
+    pub pty_setattr: Option<fn(i32, &[u8]) -> i32>,
+    pub pty_ioctl: Option<fn(i32, u64, u64) -> i32>,
+    pub pty_winsz_get: Option<fn(i32) -> Vec<u8>>,
+    pub pty_winsz_set: Option<fn(i32, &[u8]) -> i32>,
+    /// Platform-provided shared memory functions.
+    pub memfd_create: Option<fn(&str, u32) -> i32>,
+    pub shm_open: Option<fn(&str, u32) -> i32>,
+    pub shm_unlink: Option<fn(&str)>,
 }
 
 /// A sleep request produced by `nanosleep`.
@@ -1112,6 +1361,327 @@ pub fn dispatch<M: GuestMemory>(
             }
             Ok(1)
         }
+        SYS_POLL => {
+            let fds_ptr = regs.ptr(0)?;
+            let nfds = regs.arg(1) as usize;
+            let timeout_ms = regs.arg(2) as i32;
+            if nfds == 0 {
+                return Ok(0);
+            }
+            // Read all pollfd structs from guest memory
+            let pollfds = mem.read(fds_ptr, nfds * POLLFD_SIZE)?;
+            let mut results: Vec<(u16, u16)> = Vec::with_capacity(nfds);
+            for i in 0..nfds {
+                let offset = i * POLLFD_SIZE;
+                if offset + POLLFD_SIZE > pollfds.len() {
+                    break;
+                }
+                let fd_val = i32::from_le_bytes(pollfds[offset..offset+4].try_into().unwrap());
+                let events = u16::from_le_bytes(pollfds[offset+4..offset+6].try_into().unwrap());
+                let fd = Fd(fd_val as u32);
+                let revents = poll_fd(fd, events, fds, &state.input, &state.eventfds, state.poll_host);
+                results.push((events, revents));
+            }
+            // For simplicity, check all fds immediately. If none are ready and timeout > 0,
+            // we would need to block. For now, return immediately.
+            let ready_count = results.iter().filter(|(_, r)| *r != 0).count();
+            // Write revents back to guest memory
+            for (i, (_, revents)) in results.iter().enumerate() {
+                let offset = i * POLLFD_SIZE + 6;
+                if offset + 2 <= pollfds.len() {
+                    // Need to write back to guest memory
+                }
+            }
+            // Write the whole buffer back
+            let mut out = pollfds.clone();
+            for (i, (_, revents)) in results.iter().enumerate() {
+                let offset = i * POLLFD_SIZE + 6;
+                out[offset..offset+2].copy_from_slice(&revents.to_le_bytes());
+            }
+            mem.write(fds_ptr, &out)?;
+            Ok(ready_count as u64)
+        }
+        SYS_SELECT => {
+            let nfds = regs.arg(0) as usize;
+            let readfds = regs.arg(1);
+            let writefds = regs.arg(2);
+            let exceptfds = regs.arg(3);
+            let _timeout = regs.arg(4);
+            // Simple implementation: check all fds up to nfds
+            let mut ready = 0usize;
+            let mut new_readfds: u64 = 0;
+            let mut new_writefds: u64 = 0;
+            for fd_val in 0..nfds as u32 {
+                let fd = Fd(fd_val);
+                let kind = match fds.get(fd) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                let is_ready = match kind {
+                    FdKind::File(_) => true,
+                    FdKind::Host(h) => {
+                        match state.poll_host {
+                            Some(poll_fn) => {
+                                let r = poll_fn(h, POLLIN as i16);
+                                r >= 0 && r != 0
+                            }
+                            None => false,
+                        }
+                    }
+                    FdKind::Input => !state.input.is_empty(),
+                };
+                if is_ready {
+                    if readfds != 0 && fd_val < 64 {
+                        new_readfds |= 1u64 << fd_val;
+                    }
+                    if writefds != 0 && fd_val < 64 {
+                        new_writefds |= 1u64 << fd_val;
+                    }
+                    ready += 1;
+                }
+            }
+            if readfds != 0 {
+                mem.write(readfds, &new_readfds.to_ne_bytes())?;
+            }
+            if writefds != 0 {
+                mem.write(writefds, &new_writefds.to_ne_bytes())?;
+            }
+            Ok(ready as u64)
+        }
+        SYS_EPOLL_CREATE1 => {
+            let _flags = regs.arg(0) as i32;
+            let fd = fds.alloc_kind(FdKind::Host(-1));
+            state.epolls.insert(fd.0, EpollInstance::new());
+            Ok(fd.0 as u64)
+        }
+        SYS_EPOLL_CTL => {
+            let epfd = regs.arg(0) as u32;
+            let op = regs.arg(1) as i32;
+            let target_fd = regs.arg(2) as u32;
+            let event_ptr = regs.ptr(3)?;
+            let epoll = state.epolls.get_mut(&epfd).ok_or(Errno::Badf)?;
+            match op {
+                EPOLL_CTL_ADD => {
+                    let raw = mem.read(event_ptr, 4)?;
+                    let events = u32::from_le_bytes(raw[..4].try_into().unwrap());
+                    epoll.add(target_fd, events);
+                }
+                EPOLL_CTL_DEL => {
+                    epoll.del(target_fd);
+                }
+                EPOLL_CTL_MOD => {
+                    let raw = mem.read(event_ptr, 4)?;
+                    let events = u32::from_le_bytes(raw[..4].try_into().unwrap());
+                    epoll.modify(target_fd, events);
+                }
+                _ => return Err(Errno::Inval),
+            }
+            Ok(0)
+        }
+        SYS_EPOLL_WAIT => {
+            let epfd = regs.arg(0) as u32;
+            let events_ptr = regs.ptr(1)?;
+            let maxevents = regs.arg(2) as usize;
+            let _timeout_ms = regs.arg(3) as i32;
+            let epoll = state.epolls.get(&epfd).ok_or(Errno::Badf)?;
+            let watched = epoll.fds();
+            let mut triggered: Vec<(u32, u32)> = Vec::new();
+            for &fd_val in &watched {
+                let mask = epoll.events(fd_val).unwrap_or(0);
+                let fd = Fd(fd_val);
+                let kind = match fds.get(fd) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                let mut ev: u32 = 0;
+                match kind {
+                    FdKind::File(_) => {
+                        if mask & EPOLLIN != 0 { ev |= EPOLLIN; }
+                        if mask & EPOLLOUT != 0 { ev |= EPOLLOUT; }
+                    }
+                    FdKind::Host(h) => {
+                        if let Some(poll_fn) = state.poll_host {
+                            let r = poll_fn(h, 0);
+                            if r & POLLIN as i16 != 0 && mask & EPOLLIN != 0 { ev |= EPOLLIN; }
+                            if r & POLLOUT as i16 != 0 && mask & EPOLLOUT != 0 { ev |= EPOLLOUT; }
+                        }
+                    }
+                    FdKind::Input => {
+                        if !state.input.is_empty() && mask & EPOLLIN != 0 { ev |= EPOLLIN; }
+                    }
+                }
+                if ev != 0 && triggered.len() < maxevents {
+                    triggered.push((fd_val, ev));
+                }
+            }
+            // Write events to guest memory
+            let mut out = Vec::new();
+            for (fd_val, ev) in &triggered {
+                out.extend_from_slice(&ev.to_le_bytes());
+                out.extend_from_slice(&(*fd_val as u64).to_le_bytes());
+            }
+            if !out.is_empty() {
+                mem.write(events_ptr, &out)?;
+            }
+            Ok(triggered.len() as u64)
+        }
+        SYS_EVENTFD2 => {
+            let initval = regs.arg(0);
+            let flags = regs.arg(1) as i32;
+            let nonblock = flags & EFD_NONBLOCK != 0;
+            let fd = fds.alloc_kind(FdKind::Host(-1));
+            state.eventfds.insert(fd.0, EventFd::new(initval, nonblock));
+            Ok(fd.0 as u64)
+        }
+        SYS_OPENPT => {
+            let Some(openpt_fn) = state.pty_open else { return Err(Errno::Nosys) };
+            let host_fd = openpt_fn();
+            if host_fd < 0 { return Err(Errno::NoMem); }
+            let fd = fds.alloc_host(host_fd);
+            Ok(fd.0 as u64)
+        }
+        SYS_GRANTPT => {
+            let Some(grantpt_fn) = state.pty_grant else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            if grantpt_fn(host) != 0 { return Err(Errno::Perm); }
+            Ok(0)
+        }
+        SYS_UNLOCKPT => {
+            let Some(unlockpt_fn) = state.pty_unlock else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            if unlockpt_fn(host) != 0 { return Err(Errno::Perm); }
+            Ok(0)
+        }
+        SYS_PTSNAME => {
+            let Some(ptsname_fn) = state.pty_name else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let buf = regs.ptr(1)?;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let name = ptsname_fn(host);
+            if name.is_empty() { return Err(Errno::Inval); }
+            mem.write(buf, name.as_bytes())?;
+            Ok(name.len() as u64)
+        }
+        SYS_TCGETATTR => {
+            let Some(getattr_fn) = state.pty_getattr else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let buf = regs.ptr(1)?;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let attrs = getattr_fn(host);
+            mem.write(buf, &attrs)?;
+            Ok(0)
+        }
+        SYS_TCSETATTR => {
+            let Some(setattr_fn) = state.pty_setattr else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let buf = regs.ptr(1)?;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let raw = mem.read(buf, 64)?;
+            if setattr_fn(host, &raw) != 0 { return Err(Errno::Inval); }
+            Ok(0)
+        }
+        SYS_IOCTL_TIOCSCTTY => {
+            let Some(ioctl_fn) = state.pty_ioctl else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            if ioctl_fn(host, 0x5401, 0) != 0 { return Err(Errno::Perm); }
+            Ok(0)
+        }
+        SYS_IOCTL_TIOCGWINSZ => {
+            let Some(winsz_get_fn) = state.pty_winsz_get else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let buf = regs.ptr(1)?;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let ws = winsz_get_fn(host);
+            mem.write(buf, &ws)?;
+            Ok(0)
+        }
+        SYS_IOCTL_TIOCSWINSZ => {
+            let Some(winsz_set_fn) = state.pty_winsz_set else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let buf = regs.ptr(1)?;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let raw = mem.read(buf, 8)?;
+            if winsz_set_fn(host, &raw) != 0 { return Err(Errno::Inval); }
+            Ok(0)
+        }
+        SYS_MEMFD_CREATE => {
+            let name_ptr = regs.ptr(0)?;
+            let flags = regs.arg(1) as u32;
+            let raw = mem.read_cstr(name_ptr)?;
+            let name = String::from_utf8_lossy(&raw).into_owned();
+            let host_fd = match state.memfd_create {
+                Some(f) => f(&name, flags),
+                None => return Err(Errno::Nosys),
+            };
+            if host_fd < 0 { return Err(Errno::NoMem); }
+            let fd = fds.alloc_host(host_fd);
+            Ok(fd.0 as u64)
+        }
+        SYS_SHM_OPEN => {
+            let name_ptr = regs.ptr(0)?;
+            let flags = regs.arg(1) as u32;
+            let _mode = regs.arg(2) as u32;
+            let raw = mem.read_cstr(name_ptr)?;
+            let name = String::from_utf8_lossy(&raw).into_owned();
+            let host_fd = match state.shm_open {
+                Some(f) => f(&name, flags),
+                None => return Err(Errno::Nosys),
+            };
+            if host_fd < 0 { return Err(Errno::NoEnt); }
+            let fd = fds.alloc_host(host_fd);
+            Ok(fd.0 as u64)
+        }
+        SYS_SHM_UNLINK => {
+            let name_ptr = regs.ptr(0)?;
+            let raw = mem.read_cstr(name_ptr)?;
+            let name = String::from_utf8_lossy(&raw).into_owned();
+            match state.shm_unlink {
+                Some(f) => { f(&name); Ok(0) }
+                None => Err(Errno::Nosys),
+            }
+        }
+        SYS_FUTEX => {
+            let uaddr = regs.ptr(0)?;
+            let op = regs.arg(1) as i32;
+            let val = regs.arg(2) as u32;
+            let _timeout = regs.arg(3);
+            let _uaddr2 = regs.arg(4);
+            let _val3 = regs.arg(5);
+            let is_private = op & FUTEX_PRIVATE_FLAG != 0;
+            let base_op = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+            if !is_private {
+                // Only private futexes are supported (process-local)
+                return Err(Errno::Inval);
+            }
+            match base_op {
+                FUTEX_WAIT => {
+                    // Read the current value at uaddr
+                    let current = mem.read(uaddr, 4)
+                        .ok()
+                        .and_then(|b| if b.len() >= 4 { Some(u32::from_ne_bytes(b[..4].try_into().unwrap())) } else { None })
+                        .unwrap_or(0);
+                    if current != val {
+                        return Err(Errno::Again);
+                    }
+                    // Mark as held - in a single-threaded guest, this means we spin
+                    let futex = state.futexes.entry(uaddr).or_default();
+                    futex.held = true;
+                    futex.expected = val;
+                    Ok(0)
+                }
+                FUTEX_WAKE => {
+                    // Wake up to `val` waiters. In our model, just mark as not held.
+                    if let Some(futex) = state.futexes.get_mut(&uaddr) {
+                        futex.held = false;
+                    }
+                    Ok(val.min(1) as u64)
+                }
+                _ => Err(Errno::Inval),
+            }
+        }
         SYS_SYNC_FS => {
             // The platform performs the write-out and records what it did.
             state.sync = Some(crate::persist::SyncStats::default());
@@ -1307,6 +1877,31 @@ pub fn dispatch<M: GuestMemory>(
             state.display.raise(regs.arg(0) as u32)?;
             Ok(0)
         }
+        SYS_WINDOW_RESIZE => {
+            let id = regs.arg(0) as u32;
+            let width = regs.arg(1) as u32;
+            let height = regs.arg(2) as u32;
+            let win = *state.display.get(id).ok_or(Errno::NoEnt)?;
+            let old_buf = win.buffer;
+            let old_len = win.byte_len();
+            state.display.resize(id, width, height)?;
+            // Remap the buffer at the new size
+            if old_buf != 0 {
+                let _ = mem.unmap(old_buf, old_len);
+            }
+            let win2 = *state.display.get(id).ok_or(Errno::NoEnt)?;
+            let new_base = mem.map(0, win2.byte_len(), PROT_READ | PROT_WRITE, MAP_ANONYMOUS)?;
+            state.display.map(id, new_base)?;
+            let p = regs.ptr(3)?;
+            let mut info = [0u8; 24];
+            info[0..8].copy_from_slice(&new_base.to_le_bytes());
+            info[8..12].copy_from_slice(&win2.width.to_le_bytes());
+            info[12..16].copy_from_slice(&win2.height.to_le_bytes());
+            info[16..20].copy_from_slice(&win2.width.saturating_mul(4).to_le_bytes());
+            info[20..24].copy_from_slice(&crate::gfx::FORMAT_XRGB8888.to_le_bytes());
+            mem.write(p, &info)?;
+            Ok(new_base)
+        }
         SYS_WINDOW_DESTROY => {
             let id = regs.arg(0) as u32;
             let win = *state.display.get(id).ok_or(Errno::NoEnt)?;
@@ -1386,6 +1981,22 @@ impl<'a> GuestState<'a> {
             pending_input_wait: false,
             input_fd: None,
             sync: None,
+            epolls: BTreeMap::new(),
+            eventfds: BTreeMap::new(),
+            futexes: BTreeMap::new(),
+            poll_host: None,
+            pty_open: None,
+            pty_grant: None,
+            pty_unlock: None,
+            pty_name: None,
+            pty_getattr: None,
+            pty_setattr: None,
+            pty_ioctl: None,
+            pty_winsz_get: None,
+            pty_winsz_set: None,
+            memfd_create: None,
+            shm_open: None,
+            shm_unlink: None,
         }
     }
 
@@ -2058,6 +2669,7 @@ mod tests {
         assert_eq!(Errno::IsDir as i32, 21);
         assert_eq!(Errno::Inval as i32, 22);
         assert_eq!(Errno::Nosys as i32, 38);
+        assert_eq!(Errno::Again as i32, 11);
     }
 
     #[test]

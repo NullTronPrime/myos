@@ -11,12 +11,12 @@ cargo build --release
 
 out=target/guest
 root=target/rootfs
-cc=${CC:-gcc}
+cc=${CC:-/c/msys64/ucrt64/bin/gcc.exe}
 
-mkdir -p "$out" "$root/bin" "$root/etc" "$root/dev"
+mkdir -p "$out" "$root/bin" "$root/etc" "$root/dev" "$root/lib"
 
 # Guests that link the host's static glibc: fixed-address, no interpreter.
-for g in sh catfile catstdin proc_parent proc_child fb_paint; do
+for g in sh sh2 init window_server desktop_shell terminal catfile catstdin proc_parent proc_child fb_paint; do
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/$g" "guest/$g.c"
 done
 
@@ -32,8 +32,14 @@ done
     -Iguest/lib -O2 -o "$out/pie_guest" \
     guest/lib/crt0.S guest/lib/minic.c guest/pie_guest.c
 
+# Our own libc.so: a shared library that guests can link against dynamically.
+"$cc" -nostdlib -shared -fPIC -fno-stack-protector -fno-builtin \
+    -Iguest/lib -O2 -o "$root/lib/libc.so" \
+    guest/lib/minic.c -Wl,-soname,libc.so
+
 # Populate the directory the guest sees as /.
-cp "$out/sh" "$out/dyn_hello" "$out/pie_guest" "$out/selfhost" \
+cp "$out/sh" "$out/sh2" "$out/init" "$out/window_server" "$out/desktop_shell" "$out/terminal" \
+   "$out/dyn_hello" "$out/pie_guest" "$out/selfhost" \
    "$out/catfile" "$out/catstdin" "$root/bin/"
 printf 'myos: parasitic kernel, running inside a process.\n' > "$root/etc/motd"
 printf 'os-1.0\n' > "$root/etc/version"

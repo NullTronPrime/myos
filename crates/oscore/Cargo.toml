@@ -6,3 +6,10 @@ rust-version.workspace = true
 description = "Pure, host-testable core of the parasitic OS. No libc, no unsafe."
 
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "wingdi", "libloaderapi"] }
+
+[[example]]
+name = "win_display"
+path = "examples/win_display.rs"

@@ -152,7 +152,12 @@ fn main() {
     // happens to be in our environment.
     let envp: Vec<CString> = Vec::new();
 
-    let loaded = match loader::prepare(&image, &bytes, &c_args, &envp) {
+    let root_path = if has_root {
+        Some(std::path::PathBuf::from(std::env::var_os("MYOS_ROOT").unwrap()))
+    } else {
+        None
+    };
+    let loaded = match loader::prepare(&image, &bytes, &c_args, &envp, root_path.as_deref()) {
         Ok(l) => l,
         Err(e) => fail(e),
     };
@@ -179,6 +184,13 @@ fn main() {
             }
             loader::enter(loaded.entry, loaded.stack_top);
         }
+
+        // Start the compositor loop in a background thread. This drives
+        // presentation at ~60fps, polling input and compositing dirty windows
+        // independently of guest `display_present` calls.
+        std::thread::spawn(|| {
+            osplat::display::compositor_loop();
+        });
 
         // The guest runs in a forked child so a crash cannot take the launcher
         // with it, and so the filter is installed only in the process it

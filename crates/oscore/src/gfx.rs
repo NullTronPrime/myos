@@ -13,6 +13,8 @@ use crate::vfs::Errno;
 
 /// Pixel format identifier reported to the guest: XRGB8888.
 pub const FORMAT_XRGB8888: u32 = 0;
+/// Pixel format identifier: ARGB8888 (with alpha).
+pub const FORMAT_ARGB8888: u32 = 1;
 
 /// The colour the compositor clears the screen to before drawing windows.
 pub const BACKGROUND: u32 = 0x0010_1418;
@@ -115,6 +117,7 @@ impl Framebuffer {
     }
 
     /// Copies `src` onto this surface with its top-left at `(x, y)`, clipped.
+    /// If `alpha` is true, treats pixels as ARGB8888 and blends.
     pub fn blit(&mut self, x: i32, y: i32, src: &Framebuffer) {
         self.blit_pixels(x, y, src.width, src.height, src.pixels());
     }
@@ -122,7 +125,13 @@ impl Framebuffer {
     /// Copies a `w * h` block of pixels, clipped to the surface.
     ///
     /// The block is read row-major; `src` must hold at least `w * h` pixels.
+    /// If `alpha` is true, treats pixels as ARGB8888 and blends them.
     pub fn blit_pixels(&mut self, x: i32, y: i32, w: u32, h: u32, src: &[u32]) {
+        self.blit_pixels_alpha(x, y, w, h, src, false);
+    }
+
+    /// Copies a `w * h` block of pixels with optional alpha blending.
+    pub fn blit_pixels_alpha(&mut self, x: i32, y: i32, w: u32, h: u32, src: &[u32], alpha: bool) {
         if w == 0 || h == 0 {
             return;
         }
@@ -140,8 +149,32 @@ impl Framebuffer {
                 if dx < 0 || dx >= self.width as i32 {
                     continue;
                 }
-                self.pixels[dy as usize * self.width as usize + dx as usize] =
-                    src[row as usize * w as usize + col as usize];
+                let src_px = src[row as usize * w as usize + col as usize];
+                let dst_idx = dy as usize * self.width as usize + dx as usize;
+                if alpha {
+                    let a = (src_px >> 24) as u32;
+                    if a == 0 {
+                        continue; // fully transparent
+                    }
+                    if a == 255 {
+                        self.pixels[dst_idx] = src_px;
+                    } else {
+                        let dst = self.pixels[dst_idx];
+                        let sr = (src_px >> 16) & 0xff;
+                        let sg = (src_px >> 8) & 0xff;
+                        let sb = src_px & 0xff;
+                        let dr = (dst >> 16) & 0xff;
+                        let dg = (dst >> 8) & 0xff;
+                        let db = dst & 0xff;
+                        let inv_a = 255 - a;
+                        let r = (sr * a + dr * inv_a) / 255;
+                        let g = (sg * a + dg * inv_a) / 255;
+                        let b = (sb * a + db * inv_a) / 255;
+                        self.pixels[dst_idx] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
+                } else {
+                    self.pixels[dst_idx] = src_px;
+                }
             }
         }
     }
@@ -166,8 +199,14 @@ impl Framebuffer {
 
     /// Draws a string, advancing one glyph cell per character.
     ///
-    /// A newline returns to `x` and drops one line.
+    /// A newline returns to `x` and drops one line. If `max_width` is
+    /// Some(w), wraps text at `w` pixels.
     pub fn draw_text(&mut self, x: i32, y: i32, text: &str, fg: u32, bg: Option<u32>) {
+        self.draw_text_wrapped(x, y, text, fg, bg, None);
+    }
+
+    /// Draws a string with optional wrapping at `max_width` pixels.
+    pub fn draw_text_wrapped(&mut self, x: i32, y: i32, text: &str, fg: u32, bg: Option<u32>, max_width: Option<u32>) {
         let mut cx = x;
         let mut cy = y;
         for ch in text.chars() {
@@ -176,9 +215,20 @@ impl Framebuffer {
                 cy += GLYPH_HEIGHT as i32;
                 continue;
             }
+            if let Some(mw) = max_width {
+                if cx + GLYPH_WIDTH as i32 > x + mw as i32 {
+                    cx = x;
+                    cy += GLYPH_HEIGHT as i32;
+                }
+            }
             self.draw_char(cx, cy, ch, fg, bg);
             cx += GLYPH_WIDTH as i32;
         }
+    }
+
+    /// Draws a text cursor (vertical bar) at the given position.
+    pub fn draw_text_cursor(&mut self, x: i32, y: i32, fg: u32) {
+        self.fill_rect(x, y, 2, GLYPH_HEIGHT, fg);
     }
 
     /// Serialises to a binary PPM (P6), row-major top-to-bottom.
@@ -199,6 +249,73 @@ pub const GLYPH_WIDTH: u32 = 8;
 
 /// Height of one glyph cell in pixels.
 pub const GLYPH_HEIGHT: u32 = 8;
+
+/// Default cursor dimensions.
+pub const CURSOR_WIDTH: u32 = 12;
+pub const CURSOR_HEIGHT: u32 = 18;
+
+/// Draws a simple arrow cursor at (x, y).
+pub fn draw_cursor(fb: &mut Framebuffer, x: i32, y: i32) {
+    // Simple arrow cursor shape
+    const CURSOR: [[u32; CURSOR_WIDTH as usize]; CURSOR_HEIGHT as usize] = [
+        [0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    for (row, row_data) in CURSOR.iter().enumerate() {
+        for (col, _) in row_data.iter().enumerate() {
+            let px = x + col as i32;
+            let py = y + row as i32;
+            if px >= 0 && px < fb.width() as i32 && py >= 0 && py < fb.height() as i32 {
+                let color = CURSOR[row][col];
+                if color == 0 {
+                    // Transparent - skip
+                } else if color == 1 {
+                    fb.set(px, py, 0x00FFFFFF); // White
+                } else {
+                    fb.set(px, py, 0x00000000); // Black
+                }
+            }
+        }
+    }
+}
+
+/// Draws window decorations (title bar, border) for a window.
+pub fn draw_decorations(fb: &mut Framebuffer, win: &Window) {
+    if win.minimized {
+        return;
+    }
+    const TITLE_BAR_HEIGHT: u32 = 20;
+    const BORDER_WIDTH: u32 = 2;
+    let body_h = win.height.saturating_sub(TITLE_BAR_HEIGHT);
+    // Draw title bar background
+    fb.fill_rect(win.x, win.y, win.width, TITLE_BAR_HEIGHT, 0x00303040);
+    // Draw title text
+    let title = std::str::from_utf8(&win.title[..win.title_len as usize]).unwrap_or("");
+    fb.draw_text(win.x + 4, win.y + 4, title, 0x00FFFFFF, None);
+    // Draw border
+    fb.fill_rect(win.x, win.y + TITLE_BAR_HEIGHT as i32, BORDER_WIDTH, body_h, 0x00404050);
+    fb.fill_rect(win.x + win.width as i32 - BORDER_WIDTH as i32, win.y + TITLE_BAR_HEIGHT as i32, BORDER_WIDTH, body_h, 0x00404050);
+    fb.fill_rect(win.x, win.y + win.height as i32 - BORDER_WIDTH as i32, win.width, BORDER_WIDTH, 0x00404050);
+    // Draw close button
+    fb.fill_rect(win.x + win.width as i32 - 16, win.y + 2, 12, 12, 0x00FF4040);
+    fb.draw_text(win.x + win.width as i32 - 14, win.y + 4, "X", 0x00FFFFFF, None);
+}
 
 /// Bitmap for a printable ASCII character, or `None` outside `0x20..=0x7E`.
 ///
@@ -337,6 +454,23 @@ pub struct Window {
     pub buffer: u64,
     /// Whether the window is composited.
     pub visible: bool,
+    /// Z-order index (higher = more on top).
+    pub z: u32,
+    /// Whether the window has input focus.
+    pub focused: bool,
+    /// Whether the window is minimized.
+    pub minimized: bool,
+    /// Title text (for decorations).
+    pub title: [u8; 64],
+    /// Title length.
+    pub title_len: u32,
+    /// Dirty region: x, y, w, h. (0,0,0,0) = clean.
+    pub dirty_x: i32,
+    pub dirty_y: i32,
+    pub dirty_w: u32,
+    pub dirty_h: u32,
+    /// Whether the window buffer has been modified since last composite.
+    pub dirty: bool,
 }
 
 impl Window {
@@ -426,6 +560,16 @@ impl Display {
             height,
             buffer: 0,
             visible: false,
+            z: self.windows.len() as u32,
+            focused: false,
+            minimized: false,
+            title: [0u8; 64],
+            title_len: 0,
+            dirty_x: 0,
+            dirty_y: 0,
+            dirty_w: 0,
+            dirty_h: 0,
+            dirty: true,
         });
         Ok(id)
     }
@@ -461,8 +605,119 @@ impl Display {
     /// Moves a window to the top of the stack.
     pub fn raise(&mut self, id: u32) -> Result<(), Errno> {
         let i = self.index(id).ok_or(Errno::NoEnt)?;
+        let max_z = self.windows.iter().map(|w| w.z).max().unwrap_or(0);
+        self.windows[i].z = max_z + 1;
         let w = self.windows.remove(i);
         self.windows.push(w);
+        Ok(())
+    }
+
+    /// Marks a window's entire buffer as dirty.
+    pub fn mark_dirty(&mut self, id: u32) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.dirty = true;
+            w.dirty_x = w.x;
+            w.dirty_y = w.y;
+            w.dirty_w = w.width;
+            w.dirty_h = w.height;
+        }
+    }
+
+    /// Marks a sub-rectangle of a window as dirty.
+    pub fn mark_dirty_rect(&mut self, id: u32, x: i32, y: i32, w: u32, h: u32) {
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == id) {
+            win.dirty = true;
+            if win.dirty_w == 0 || win.dirty_h == 0 {
+                win.dirty_x = x;
+                win.dirty_y = y;
+                win.dirty_w = w;
+                win.dirty_h = h;
+            } else {
+                let x0 = win.dirty_x.min(x);
+                let y0 = win.dirty_y.min(y);
+                let x1 = (win.dirty_x + win.dirty_w as i32).max(x + w as i32);
+                let y1 = (win.dirty_y + win.dirty_h as i32).max(y + h as i32);
+                win.dirty_x = x0;
+                win.dirty_y = y0;
+                win.dirty_w = (x1 - x0) as u32;
+                win.dirty_h = (y1 - y0) as u32;
+            }
+        }
+    }
+
+    /// Clears a window's dirty flag after compositing.
+    pub fn clear_dirty(&mut self, id: u32) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.dirty = false;
+            w.dirty_w = 0;
+            w.dirty_h = 0;
+        }
+    }
+
+    /// Returns the topmost visible window at (x, y), or None.
+    pub fn hit_test(&self, x: i32, y: i32) -> Option<u32> {
+        let mut best_z: Option<u32> = None;
+        let mut best_id: Option<u32> = None;
+        for w in &self.windows {
+            if !w.visible || w.minimized || w.buffer == 0 {
+                continue;
+            }
+            if x >= w.x && x < w.x + w.width as i32 &&
+               y >= w.y && y < w.y + w.height as i32 {
+                if best_z.map_or(true, |z| w.z >= z) {
+                    best_z = Some(w.z);
+                    best_id = Some(w.id);
+                }
+            }
+        }
+        best_id
+    }
+
+    /// Sets a window's z-order index.
+    pub fn set_z(&mut self, id: u32, z: u32) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        self.windows[i].z = z;
+        Ok(())
+    }
+
+    /// Lowers a window below all others.
+    pub fn lower(&mut self, id: u32) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        let min_z = self.windows.iter().map(|w| w.z).min().unwrap_or(0);
+        self.windows[i].z = min_z.saturating_sub(1);
+        // Move to front of vector (bottom of paint order)
+        let w = self.windows.remove(i);
+        self.windows.insert(0, w);
+        Ok(())
+    }
+
+    /// Toggles a window's minimized state.
+    pub fn toggle_minimize(&mut self, id: u32) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        self.windows[i].minimized = !self.windows[i].minimized;
+        Ok(())
+    }
+
+    /// Sets a window's title.
+    pub fn set_title(&mut self, id: u32, title: &str) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        let n = title.len().min(63);
+        self.windows[i].title[..n].copy_from_slice(&title.as_bytes()[..n]);
+        self.windows[i].title[n] = 0;
+        self.windows[i].title_len = n as u32;
+        Ok(())
+    }
+
+    /// Resizes a window and returns the new buffer address.
+    pub fn resize(&mut self, id: u32, width: u32, height: u32) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        self.windows[i].width = width;
+        self.windows[i].height = height;
+        self.windows[i].dirty = true;
+        self.windows[i].dirty_x = self.windows[i].x;
+        self.windows[i].dirty_y = self.windows[i].y;
+        self.windows[i].dirty_w = width;
+        self.windows[i].dirty_h = height;
         Ok(())
     }
 
@@ -697,5 +952,114 @@ mod tests {
         assert_eq!(fb.get(2, 8), Some(rgb(255, 255, 255)), "'C' after newline");
         assert_eq!(fb.get(10, 8), Some(rgb(255, 255, 255)), "'D' after newline");
         assert_eq!(text_width("AB\nCDE"), 24);
+    }
+
+    #[test]
+    fn draw_text_wrapped_wraps_at_max_width() {
+        let mut fb = Framebuffer::new(32, 16);
+        fb.draw_text_wrapped(0, 0, "ABCDEF", rgb(255, 255, 255), Some(rgb(0, 0, 0)), Some(24));
+        // 'A' at (2,0), 'B' at (10,0), 'C' at (18,0) — 3 chars fit in 24px.
+        assert_eq!(fb.get(2, 0), Some(rgb(255, 255, 255)), "'A' at x=2");
+        assert_eq!(fb.get(10, 0), Some(rgb(255, 255, 255)), "'B' at x=10");
+        assert_eq!(fb.get(18, 0), Some(rgb(255, 255, 255)), "'C' at x=18");
+        // 'D' wraps to next line (y=8) because x=24 exceeds max_width=24.
+        assert_eq!(fb.get(2, 8), Some(rgb(255, 255, 255)), "'D' wrapped to y=8");
+    }
+
+    #[test]
+    fn draw_text_cursor_draws_vertical_bar() {
+        let mut fb = Framebuffer::new(8, 8);
+        fb.draw_text_cursor(2, 0, rgb(255, 255, 255));
+        assert_eq!(fb.get(2, 0), Some(rgb(255, 255, 255)));
+        assert_eq!(fb.get(3, 0), Some(rgb(255, 255, 255)));
+        assert_eq!(fb.get(2, 7), Some(rgb(255, 255, 255)));
+        assert_eq!(fb.get(4, 0), Some(0), "cursor is only 2px wide");
+    }
+
+    #[test]
+    fn alpha_blending_works_correctly() {
+        let mut dst = Framebuffer::new(2, 1);
+        dst.set(0, 0, rgb(255, 0, 0)); // Red background
+        let mut src = Framebuffer::new(1, 1);
+        src.set(0, 0, 0x800000FF); // 50% opaque blue
+        dst.blit_pixels_alpha(0, 0, 1, 1, src.pixels(), true);
+        // 50% blend of red (255,0,0) and blue (0,0,255) = (127,0,127)
+        let result = dst.get(0, 0).unwrap();
+        let r = (result >> 16) & 0xff;
+        let b = result & 0xff;
+        assert!(r > 100 && r < 150, "red channel should be ~127, got {r}");
+        assert!(b > 100 && b < 150, "blue channel should be ~127, got {b}");
+    }
+
+    #[test]
+    fn hit_test_finds_topmost_window() {
+        let mut d = Display::new(100, 100);
+        let a = d.create(30, 30).unwrap();
+        let b = d.create(30, 30).unwrap();
+        d.map(a, 0x1000).unwrap();
+        d.map(b, 0x2000).unwrap();
+        d.move_to(a, 0, 0).unwrap();
+        d.move_to(b, 0, 0).unwrap();
+        d.show(a).unwrap();
+        d.show(b).unwrap();
+        // b is on top (created later, higher z)
+        assert_eq!(d.hit_test(15, 15), Some(b));
+        d.raise(a).unwrap();
+        assert_eq!(d.hit_test(15, 15), Some(a));
+    }
+
+    #[test]
+    fn hit_test_skips_invisible_and_minimized() {
+        let mut d = Display::new(100, 100);
+        let a = d.create(10, 10).unwrap();
+        d.map(a, 0x1000).unwrap();
+        d.show(a).unwrap();
+        assert_eq!(d.hit_test(5, 5), Some(a));
+        d.toggle_minimize(a).unwrap();
+        assert_eq!(d.hit_test(5, 5), None, "minimized window should not be hit");
+    }
+
+    #[test]
+    fn lower_moves_window_below_others() {
+        let mut d = Display::new(100, 100);
+        let a = d.create(10, 10).unwrap();
+        let b = d.create(10, 10).unwrap();
+        d.map(a, 0x1000).unwrap();
+        d.map(b, 0x2000).unwrap();
+        d.show(a).unwrap();
+        d.show(b).unwrap();
+        d.move_to(a, 0, 0).unwrap();
+        d.move_to(b, 0, 0).unwrap();
+        assert_eq!(d.hit_test(5, 5), Some(b));
+        d.lower(a).unwrap();
+        assert_eq!(d.hit_test(5, 5), Some(b));
+        d.raise(a).unwrap();
+        assert_eq!(d.hit_test(5, 5), Some(a));
+    }
+
+    #[test]
+    fn damage_tracking_marks_and_clears() {
+        let mut d = Display::new(100, 100);
+        let id = d.create(10, 10).unwrap();
+        assert!(d.get(id).unwrap().dirty, "new window starts dirty");
+        d.clear_dirty(id);
+        assert!(!d.get(id).unwrap().dirty);
+        d.mark_dirty(id);
+        assert!(d.get(id).unwrap().dirty);
+        d.mark_dirty_rect(id, 2, 3, 4, 5);
+        let w = d.get(id).unwrap();
+        assert!(w.dirty);
+    }
+
+    #[test]
+    fn resize_marks_window_dirty() {
+        let mut d = Display::new(100, 100);
+        let id = d.create(10, 10).unwrap();
+        d.clear_dirty(id);
+        d.resize(id, 20, 30).unwrap();
+        let w = d.get(id).unwrap();
+        assert_eq!(w.width, 20);
+        assert_eq!(w.height, 30);
+        assert!(w.dirty, "resize should mark dirty");
     }
 }

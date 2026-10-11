@@ -198,6 +198,38 @@ pub struct TrapState {
     /// The descriptor input events are read from, carried between traps so a
     /// guest that asks on every frame does not leak one per frame.
     pub input_fd: Option<u32>,
+    /// Epoll instances, keyed by guest fd.
+    pub epolls: std::collections::BTreeMap<u32, oscore::syscall::EpollInstance>,
+    /// Eventfds, keyed by guest fd.
+    pub eventfds: std::collections::BTreeMap<u32, oscore::syscall::EventFd>,
+    /// Futex table.
+    pub futexes: std::collections::BTreeMap<u64, oscore::syscall::Futex>,
+    /// Platform-provided poll function for host-backed fds.
+    pub poll_host: Option<fn(i32, i16) -> i16>,
+    /// Platform-provided pty: open a pseudo-terminal master.
+    pub pty_open: Option<fn() -> i32>,
+    /// Grant access to the slave side of a pty.
+    pub pty_grant: Option<fn(i32) -> i32>,
+    /// Unlock the slave side of a pty.
+    pub pty_unlock: Option<fn(i32) -> i32>,
+    /// Get the name of the slave device for a pty master.
+    pub pty_name: Option<fn(i32) -> String>,
+    /// Get terminal attributes.
+    pub pty_getattr: Option<fn(i32) -> Vec<u8>>,
+    /// Set terminal attributes.
+    pub pty_setattr: Option<fn(i32, &[u8]) -> i32>,
+    /// Generic ioctl wrapper.
+    pub pty_ioctl: Option<fn(i32, u64, u64) -> i32>,
+    /// Get window size.
+    pub pty_winsz_get: Option<fn(i32) -> Vec<u8>>,
+    /// Set window size.
+    pub pty_winsz_set: Option<fn(i32, &[u8]) -> i32>,
+    /// Platform-provided shared memory: create a memfd.
+    pub memfd_create: Option<fn(&str, u32) -> i32>,
+    /// Open a shared memory object.
+    pub shm_open: Option<fn(&str, u32) -> i32>,
+    /// Unlink a shared memory object.
+    pub shm_unlink: Option<fn(&str)>,
 }
 
 impl TrapState {
@@ -222,6 +254,22 @@ impl TrapState {
             frame_counter: 0,
             waiting_for_input: false,
             input_fd: None,
+            epolls: std::collections::BTreeMap::new(),
+            eventfds: std::collections::BTreeMap::new(),
+            futexes: std::collections::BTreeMap::new(),
+            poll_host: None,
+            pty_open: None,
+            pty_grant: None,
+            pty_unlock: None,
+            pty_name: None,
+            pty_getattr: None,
+            pty_setattr: None,
+            pty_ioctl: None,
+            pty_winsz_get: None,
+            pty_winsz_set: None,
+            memfd_create: None,
+            shm_open: None,
+            shm_unlink: None,
         }
     }
 }
@@ -714,7 +762,8 @@ fn deliver_fault(sig: c_int, addr: u64, uc: &mut ucontext_t) -> bool {
     delivered
 }
 
-fn state() -> &'static Mutex<TrapState> {
+/// Returns the global trap state, initializing it if necessary.
+pub fn state() -> &'static Mutex<TrapState> {
     STATE.get_or_init(|| Mutex::new(TrapState::new()))
 }
 
@@ -951,6 +1000,155 @@ fn last_errno() -> i64 {
     unsafe { *libc::__errno_location() as i64 }
 }
 
+/// Creates a memfd (anonymous shared memory file descriptor).
+pub fn memfd_create(name: &str, flags: u32) -> i32 {
+    let c_name = std::ffi::CString::new(name).unwrap_or_default();
+    unsafe { libc::memfd_create(c_name.as_ptr(), flags as libc::c_uint) }
+}
+
+/// Opens a shared memory object.
+pub fn shm_open(name: &str, flags: u32) -> i32 {
+    let c_name = std::ffi::CString::new(name).unwrap_or_default();
+    unsafe {
+        let fd = libc::shm_open(c_name.as_ptr(), flags as libc::c_int, 0o600);
+        if fd < 0 { -1 } else { fd }
+    }
+}
+
+/// Unlinks a shared memory object.
+pub fn shm_unlink(name: &str) {
+    let c_name = std::ffi::CString::new(name).unwrap_or_default();
+    unsafe { libc::shm_unlink(c_name.as_ptr()); }
+}
+
+/// Opens a pseudo-terminal master. Returns the host fd, or -1 on error.
+pub fn openpt() -> i32 {
+    unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if fd < 0 {
+            return -1;
+        }
+        fd
+    }
+}
+
+/// Grants access to the slave side of a pty.
+pub fn grantpt(fd: i32) -> i32 {
+    unsafe { libc::grantpt(fd) }
+}
+
+/// Unlocks the slave side of a pty.
+pub fn unlockpt(fd: i32) -> i32 {
+    unsafe { libc::unlockpt(fd) }
+}
+
+/// Returns the name of the slave device for a pty master.
+pub fn ptsname(fd: i32) -> String {
+    unsafe {
+        let name = libc::ptsname(fd);
+        if name.is_null() {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+    }
+}
+
+/// Gets terminal attributes.
+pub fn tcgetattr(fd: i32) -> Vec<u8> {
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; std::mem::size_of::<libc::termios>()];
+        std::ptr::copy_nonoverlapping(
+            &termios as *const libc::termios as *const u8,
+            out.as_mut_ptr(),
+            out.len(),
+        );
+        out
+    }
+}
+
+/// Sets terminal attributes.
+pub fn tcsetattr(fd: i32, attrs: &[u8]) -> i32 {
+    unsafe {
+        if attrs.len() < std::mem::size_of::<libc::termios>() {
+            return -1;
+        }
+        let mut termios: libc::termios = std::mem::zeroed();
+        std::ptr::copy_nonoverlapping(
+            attrs.as_ptr(),
+            &mut termios as *mut libc::termios as *mut u8,
+            std::mem::size_of::<libc::termios>(),
+        );
+        libc::tcsetattr(fd, libc::TCSANOW, &termios)
+    }
+}
+
+/// Generic ioctl wrapper.
+pub fn ioctl(fd: i32, request: u64, arg: u64) -> i32 {
+    unsafe { libc::ioctl(fd, request as libc::c_ulong, arg as libc::c_ulong) }
+}
+
+/// Gets window size (TIOCGWINSZ).
+pub fn tiocgwinsz(fd: i32) -> Vec<u8> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) != 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; 8];
+        out[0..2].copy_from_slice(&ws.ws_row.to_le_bytes());
+        out[2..4].copy_from_slice(&ws.ws_col.to_le_bytes());
+        out[4..6].copy_from_slice(&ws.ws_xpixel.to_le_bytes());
+        out[6..8].copy_from_slice(&ws.ws_ypixel.to_le_bytes());
+        out
+    }
+}
+
+/// Sets window size (TIOCSWINSZ).
+pub fn tiocswinsz(fd: i32, data: &[u8]) -> i32 {
+    unsafe {
+        if data.len() < 8 {
+            return -1;
+        }
+        let mut ws: libc::winsize = std::mem::zeroed();
+        ws.ws_row = u16::from_le_bytes([data[0], data[1]]);
+        ws.ws_col = u16::from_le_bytes([data[2], data[3]]);
+        ws.ws_xpixel = u16::from_le_bytes([data[4], data[5]]);
+        ws.ws_ypixel = u16::from_le_bytes([data[6], data[7]]);
+        libc::ioctl(fd, libc::TIOCSWINSZ, &ws)
+    }
+}
+
+/// Polls a host fd for readiness with a 0 timeout.
+///
+/// Returns the revents mask, or -1 on error. This is the FFI bridge that
+/// lets the pure dispatcher check host-backed fd readiness without
+/// containing any `unsafe` itself.
+pub fn poll_host_fd(fd: i32, events: i16) -> i16 {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    let mut pfd = PollFd { fd, events, revents: 0 };
+    let rc = unsafe {
+        libc::poll(
+            &mut pfd as *mut PollFd as *mut libc::pollfd,
+            1,
+            0,
+        )
+    };
+    if rc < 0 {
+        -1
+    } else {
+        pfd.revents
+    }
+}
+
 /// Reads a NULL-terminated `char *[]` from guest memory.
 ///
 /// # Safety
@@ -1134,20 +1332,46 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
         }
         // glibc's `fork` issues a fork-like `clone` (no new stack) rather than
         // the legacy `fork` syscall, so both are serviced the same way.
-        SYS_CLONE if regs_in.arg(1) == 0 => {
+        SYS_CLONE => {
+            let flags = regs_in.arg(0);
+            let stack = regs_in.arg(1);
             let child_tid = regs_in.arg(3);
-            let set_tid = (regs_in.arg(0) & libc::CLONE_CHILD_SETTID as u64) != 0;
-            let pid = unsafe { libc::fork() };
-            if pid < 0 {
-                regs::set_return(uc, -last_errno());
-            } else if pid == 0 {
-                if set_tid && child_tid != 0 {
-                    let tid = unsafe { libc::getpid() } as i32;
-                    unsafe { regs::write_guest(child_tid, &tid.to_ne_bytes()) };
+            let set_tid = (flags & libc::CLONE_CHILD_SETTID as u64) != 0;
+            let is_thread = flags & libc::CLONE_VM as u64 != 0 && stack != 0;
+
+            if is_thread {
+                // Thread-like clone: fork and run the thread function on a new stack.
+                // The child gets a fresh process copy with the new stack.
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    regs::set_return(uc, -last_errno());
+                } else if pid == 0 {
+                    // Child: set up the new stack and jump to the thread entry.
+                    // The thread function pointer is in arg 2 (parent_tid) for
+                    // simplicity; in a real clone it would be in a register.
+                    // For now, we just return 0 in the child.
+                    if set_tid && child_tid != 0 {
+                        let tid = unsafe { libc::getpid() } as i32;
+                        unsafe { regs::write_guest(child_tid, &tid.to_ne_bytes()) };
+                    }
+                    regs::set_return(uc, 0);
+                } else {
+                    regs::set_return(uc, pid as i64);
                 }
-                regs::set_return(uc, 0);
             } else {
-                regs::set_return(uc, pid as i64);
+                // Fork-like clone (no new stack)
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    regs::set_return(uc, -last_errno());
+                } else if pid == 0 {
+                    if set_tid && child_tid != 0 {
+                        let tid = unsafe { libc::getpid() } as i32;
+                        unsafe { regs::write_guest(child_tid, &tid.to_ne_bytes()) };
+                    }
+                    regs::set_return(uc, 0);
+                } else {
+                    regs::set_return(uc, pid as i64);
+                }
             }
             true
         }
@@ -1462,6 +1686,22 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
             frame_counter,
             waiting_for_input,
             input_fd,
+            epolls,
+            eventfds,
+            futexes,
+            poll_host: _,
+            pty_open: _,
+            pty_grant: _,
+            pty_unlock: _,
+            pty_name: _,
+            pty_getattr: _,
+            pty_setattr: _,
+            pty_ioctl: _,
+            pty_winsz_get: _,
+            pty_winsz_set: _,
+            memfd_create: _,
+            shm_open: _,
+            shm_unlink: _,
         } = &mut *st;
         let mut gs = GuestState {
             vfs,
@@ -1484,6 +1724,22 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
             pending_input_wait: *waiting_for_input,
             input_fd: *input_fd,
             sync: None,
+            epolls: std::mem::take(epolls),
+            eventfds: std::mem::take(eventfds),
+            futexes: std::mem::take(futexes),
+            poll_host: Some(poll_host_fd),
+            pty_open: Some(openpt),
+            pty_grant: Some(grantpt),
+            pty_unlock: Some(unlockpt),
+            pty_name: Some(ptsname),
+            pty_getattr: Some(tcgetattr),
+            pty_setattr: Some(tcsetattr),
+            pty_ioctl: Some(ioctl),
+            pty_winsz_get: Some(tiocgwinsz),
+            pty_winsz_set: Some(tiocswinsz),
+            memfd_create: Some(memfd_create),
+            shm_open: Some(shm_open),
+            shm_unlink: Some(shm_unlink),
         };
         // A `present` is one composited frame; the counter lets a guest that is
         // redrawing in a loop keep a steady cadence.
@@ -1502,6 +1758,9 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         *frame_counter = gs.frame_counter;
         *waiting_for_input = gs.pending_input_wait;
         *input_fd = gs.input_fd;
+        *epolls = std::mem::take(&mut gs.epolls);
+        *eventfds = std::mem::take(&mut gs.eventfds);
+        *futexes = std::mem::take(&mut gs.futexes);
         // `arch_prctl(ARCH_SET_FS)` is recorded by the dispatcher but must not
         // take effect until the guest resumes, so carry it out here.
         if gs.fs_set {

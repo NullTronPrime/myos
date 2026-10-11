@@ -32,6 +32,10 @@ pub enum Errno {
     Mfile = 24,
     /// Result too large to fit. Linux value is 34.
     Range = 34,
+    /// Try again. Linux value is 11.
+    Again = 11,
+    /// Operation not permitted. Linux value is 1.
+    Perm = 1,
 }
 
 pub type VfsResult<T> = Result<T, Errno>;

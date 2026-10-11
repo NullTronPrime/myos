@@ -17,6 +17,7 @@ use oscore::elf::class::Type;
 use oscore::elf::ElfImage;
 use oscore::Perms;
 use std::ffi::CString;
+use std::path::{Path, PathBuf};
 
 /// Size of the guest stack, placed just below the image's own address range.
 const STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -74,6 +75,57 @@ pub struct Loaded {
     pub at_base: u64,
 }
 
+/// Parses the DT_NEEDED entries from a guest image's dynamic section.
+///
+/// Returns the names of shared libraries the guest depends on. These are
+/// resolved against the rootfs's `lib/` directory.
+fn parse_dt_needed(image: &ElfImage, bytes: &[u8]) -> Vec<String> {
+    let Some(ph) = image.segments.iter().find(|p| p.ptype == oscore::elf::PT_DYNAMIC) else {
+        return Vec::new();
+    };
+    let Ok(entries) = oscore::link::dynamic_table(bytes, ph) else {
+        return Vec::new();
+    };
+    // Find DT_STRTAB and DT_STRSZ
+    let mut strtab: Option<u64> = None;
+    let mut strsz: u64 = 0;
+    for &(tag, val) in &entries {
+        match tag {
+            oscore::link::DT_STRTAB => strtab = Some(val as u64),
+            10 => strsz = val as u64, // DT_STRSZ
+            _ => {}
+        }
+    }
+    let Some(strtab_addr) = strtab else {
+        return Vec::new();
+    };
+    // Translate strtab address to file offset
+    let strtab_offset = match oscore::link::vaddr_to_file(image, strtab_addr) {
+        Some(off) => off,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for &(tag, val) in &entries {
+        if tag == oscore::link::DT_NEEDED {
+            // val is an offset into the string table
+            let offset = strtab_offset + val as u64;
+            let start = offset as usize;
+            if start >= bytes.len() {
+                continue;
+            }
+            let end = (start + strsz as usize).min(bytes.len());
+            if let Ok(s) = std::str::from_utf8(&bytes[start..end]) {
+                if let Some(nul) = s.find('\0') {
+                    out.push(s[..nul].to_string());
+                } else {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Maps `image` into this process and builds its initial stack.
 ///
 /// Must be called before the seccomp filter is installed: it uses `mmap`,
@@ -83,6 +135,7 @@ pub fn prepare(
     bytes: &[u8],
     argv: &[CString],
     envp: &[CString],
+    root: Option<&Path>,
 ) -> Result<Loaded, String> {
     let (base, reservation) = load_base(image, true)?;
     ensure_unmapped(image, base, reservation)?;
@@ -97,6 +150,15 @@ pub fn prepare(
     // not self-relocate -- so we apply its base-relative fixups here.
     if interpreter.is_none() && image.header.etype == Type::SharedObject {
         apply_static_relocations(image, bytes, base)?;
+    }
+
+    // Resolve DT_NEEDED dependencies: load shared libraries the guest needs.
+    // This is what lets a dynamically linked guest use our libc.so instead of
+    // the host's glibc.
+    let root = root.map(|p| p.to_path_buf());
+    let needed = parse_dt_needed(image, bytes);
+    for lib in &needed {
+        load_shared_lib(lib, root.as_deref())?;
     }
     // Two distinct addresses, and conflating them is why a dynamic guest dies.
     // We jump to the interpreter's entry point, but `AT_ENTRY` names the
@@ -178,6 +240,45 @@ fn load_interpreter(image: &ElfImage, bytes: &[u8]) -> Result<Option<Interpreter
         entry: base + img.header.entry,
         base,
     }))
+}
+
+/// Loads a shared library (DT_NEEDED dependency) and applies its relocations.
+///
+/// The library is mapped at a kernel-picked address (high, like the dynamic
+/// linker), and its `R_X86_64_RELATIVE` entries are applied. Symbol resolution
+/// against the main executable is not yet supported: only self-contained
+/// libraries with no undefined symbols can be loaded.
+fn load_shared_lib(name: &str, root: Option<&Path>) -> Result<(u64, u64), String> {
+    // Find the library in the rootfs
+    let path = match root {
+        Some(r) => r.join("lib").join(name),
+        None => PathBuf::from(name),
+    };
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("cannot read shared library {name}: {e}"))?;
+    let image = ElfImage::parse(&bytes)
+        .map_err(|e| format!("shared library {name} is not a valid ELF: {}", e.as_str()))?;
+    if image.header.etype != Type::SharedObject {
+        return Err(format!("shared library {name} is not a shared object"));
+    }
+
+    let (base, reservation) = load_base(&image, false)?;
+    ensure_unmapped(&image, base, reservation)?;
+    map_segments(&image, &bytes, base)?;
+
+    // Apply relocations
+    let relocs = oscore::link::relocations(&bytes, &image)
+        .map_err(|e| format!("cannot read relocations in {name}: {}", e.as_str()))?;
+    if !relocs.is_empty() {
+        let mut stores: Vec<(u64, u64)> = Vec::with_capacity(relocs.len());
+        oscore::link::apply_static(&relocs, base, |addr, value| stores.push((addr, value)))
+            .map_err(|t| format!("unsupported relocation type {t} in {name}"))?;
+        for (addr, value) in stores {
+            unsafe { *(addr as *mut u64) = value };
+        }
+    }
+
+    Ok((base, base + image.image_span().map(|(_, hi)| hi).unwrap_or(0)))
 }
 
 /// Applies a static PIE's base-relative relocations.

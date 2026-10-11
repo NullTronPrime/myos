@@ -150,6 +150,84 @@ pub fn is_open() -> bool {
     slot().lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// Runs the compositor loop: composites dirty windows and presents at ~60fps.
+///
+/// This is the frame loop that drives presentation independently of guest
+/// `display_present` calls. It polls input, composites dirty regions, and
+/// presents the result.
+pub fn compositor_loop() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let frame_interval = Duration::from_millis(16); // ~60fps
+    let mut last_frame = Instant::now();
+    let mut frame_count = 0u64;
+
+    loop {
+        // Poll for input events
+        let events = poll_events();
+        if !events.is_empty() {
+            if let Ok(mut g) = crate::trap::state().lock() {
+                for e in events {
+                    g.input.push(e);
+                }
+            }
+        }
+
+        // Check if any window is dirty
+        let has_dirty = {
+            let state = crate::trap::state();
+            match state.lock() {
+                Ok(g) => g.display.windows().iter().any(|w| w.dirty && w.visible && !w.minimized),
+                Err(p) => p.into_inner().display.windows().iter().any(|w| w.dirty && w.visible && !w.minimized),
+            }
+        };
+
+        if has_dirty && last_frame.elapsed() >= frame_interval {
+            // Composite and present
+            let frame = {
+                let state = crate::trap::state();
+                match state.lock() {
+                    Ok(g) => {
+                        let fb = g.display.composite(|win| {
+                            if win.buffer == 0 {
+                                return Err(oscore::vfs::Errno::Inval);
+                            }
+                            let buf = unsafe {
+                                std::slice::from_raw_parts(
+                                    win.buffer as *const u8,
+                                    win.byte_len() as usize,
+                                )
+                            };
+                            Ok(buf.chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect())
+                        }).ok();
+                        fb.map(|f| f.to_ppm())
+                    }
+                    Err(p) => None,
+                }
+            };
+            if let Some(ppm) = frame {
+                present(&ppm);
+                frame_count += 1;
+                if frame_count % 60 == 0 {
+                    eprintln!("compositor: {} frames", frame_count);
+                }
+            }
+            last_frame = Instant::now();
+        }
+
+        // Small sleep to avoid busy-waiting
+        std::thread::sleep(Duration::from_millis(1));
+
+        // Check if guest exited
+        if crate::trap::exit_status().is_some() {
+            break;
+        }
+    }
+}
+
 /// Pushes a composited frame to the window.
 ///
 /// `frame` is a PPM as produced by the core: a `P6` header followed by RGB
