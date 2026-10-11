@@ -174,7 +174,10 @@ impl Event {
         }
     }
 
-    /// Serialises to the fixed record the guest reads: 28 bytes, little-endian.
+    /// Serialises to the fixed record the guest reads: 32 bytes,
+    /// little-endian, naturally aligned so a plain C struct (no packing
+    /// pragmas) decodes it: `kind`/`window`/`x`/`y`/`button` as `u32`,
+    /// `mods`/`text` bytes, two pad bytes, then `width`/`height` as `u32`.
     pub fn to_bytes(&self) -> [u8; Self::BYTES] {
         let mut out = [0u8; Self::BYTES];
         out[0..4].copy_from_slice(&self.kind_code().to_le_bytes());
@@ -184,8 +187,9 @@ impl Event {
         out[16..20].copy_from_slice(&(self.button.code() as u32).to_le_bytes());
         out[20] = self.mods.bits();
         out[21] = self.text as u8;
-        out[22..26].copy_from_slice(&self.width.to_le_bytes());
-        out[26..30].copy_from_slice(&self.height.to_le_bytes());
+        // out[22..24] is padding, always zero.
+        out[24..28].copy_from_slice(&self.width.to_le_bytes());
+        out[28..32].copy_from_slice(&self.height.to_le_bytes());
         out
     }
 
@@ -204,7 +208,7 @@ impl Event {
     }
 
     /// Byte size of one serialised event.
-    pub const BYTES: usize = 30;
+    pub const BYTES: usize = 32;
 }
 
 /// Byte size of one serialised event.
@@ -382,11 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn record_matches_a_plain_c_struct_layout() {
+        // A C guest declares the record with no packing pragmas, so the
+        // kernel layout must equal the compiler's natural alignment:
+        // 5 x u32, 2 x u8, 2 pad bytes, 2 x u32 == 32 bytes. This test
+        // pins that contract; changing it breaks every guest reader.
+        assert_eq!(Event::BYTES, 32);
+        assert_eq!(EVENT_SIZE, 32);
+        let b = Event::simple(EventKind::MouseMove, 1).to_bytes();
+        assert_eq!(b[22], 0, "pad byte 0");
+        assert_eq!(b[23], 0, "pad byte 1");
+    }
+
+    #[test]
     fn serialised_resize_carries_both_dimensions() {
         let b = Event::resize(4, 1024, 768).to_bytes();
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 9);
-        assert_eq!(u32::from_le_bytes(b[22..26].try_into().unwrap()), 1024);
-        assert_eq!(u32::from_le_bytes(b[26..30].try_into().unwrap()), 768);
+        assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 1024);
+        assert_eq!(u32::from_le_bytes(b[28..32].try_into().unwrap()), 768);
         assert_eq!(b.len(), EVENT_SIZE);
     }
 

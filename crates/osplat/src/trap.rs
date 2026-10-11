@@ -34,9 +34,13 @@ use crate::regs;
 use libc::{c_char, c_int, c_void, sigaction, siginfo_t, ucontext_t};
 use oscore::syscall::{
     dispatch, FdKind, FdTable, GuestMemory, GuestState, Registers, MAP_ANONYMOUS, MAP_FIXED,
-    PROT_READ, PROT_WRITE, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE,
-    SYS_FORK, SYS_GETPID, SYS_IOCTL, SYS_KILL, SYS_PIPE, SYS_PIPE2, SYS_READ, SYS_RT_SIGRETURN,
-    SYS_SYNC_FS, SYS_WAIT4, SYS_WRITE,
+    PROT_READ, PROT_WRITE, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_CONNECT,
+    SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETDENTS,
+    SYS_GETPEERNAME, SYS_GETPGID, SYS_GETPGRP, SYS_GETPID, SYS_GETSID, SYS_GETSOCKNAME,
+    SYS_GETSOCKOPT, SYS_IOCTL, SYS_KILL, SYS_LISTEN, SYS_OPEN, SYS_OPENAT, SYS_PIPE, SYS_PIPE2,
+    SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RT_SIGRETURN, SYS_SENDMSG, SYS_SENDTO, SYS_SETPGID,
+    SYS_SETSID, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SYNC_FS,
+    SYS_UNLINK, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE,
 };
 use oscore::vfs::{Fd, Vfs};
 use std::ffi::CString;
@@ -224,6 +228,10 @@ pub struct TrapState {
     pub pty_winsz_get: Option<fn(i32) -> Vec<u8>>,
     /// Set window size.
     pub pty_winsz_set: Option<fn(i32, &[u8]) -> i32>,
+    /// Set foreground process group (`tcsetpgrp` job control).
+    pub pty_setpgrp: Option<fn(i32, u32) -> i32>,
+    /// Get foreground process group (`tcgetpgrp` job control).
+    pub pty_getpgrp: Option<fn(i32) -> i32>,
     /// Platform-provided shared memory: create a memfd.
     pub memfd_create: Option<fn(&str, u32) -> i32>,
     /// Open a shared memory object.
@@ -267,6 +275,8 @@ impl TrapState {
             pty_ioctl: None,
             pty_winsz_get: None,
             pty_winsz_set: None,
+            pty_setpgrp: None,
+            pty_getpgrp: None,
             memfd_create: None,
             shm_open: None,
             shm_unlink: None,
@@ -1021,6 +1031,142 @@ pub fn shm_unlink(name: &str) {
     unsafe { libc::shm_unlink(c_name.as_ptr()); }
 }
 
+/// Opens a host path on behalf of the guest.
+///
+/// Returns `None` when `path` is not bridged; otherwise the host `open()`
+/// is attempted: `Ok(fd)` on success, `Err(errno)` on failure. Bridged:
+///
+/// - `/dev/ptmx` and absolute numeric `/dev/pts/<n>` (pty masters/slaves;
+///   `ptsname()` hands the guest host paths, so without this no terminal
+///   could ever open its slave side);
+/// - `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
+///   `/etc/services` (read-only: glibc's resolver consults them, and the
+///   guest VFS carries no host network configuration);
+/// - `/dev/urandom` and `/dev/random` (read-only entropy for TLS and key
+///   generation; writes are rejected with `EPERM`);
+/// - `/winserv` and everything under it (the window-server rendezvous:
+///   client registrations and the server pid file). This is the one
+///   host-backed shared namespace: every guest process sees the same
+///   directory, which is what lets a desktop in one process discover
+///   clients living in others. Requires a configured rootfs; without one
+///   the paths stay VFS-local. Parent directories are created on demand.
+///
+/// Everything else belongs to the guest VFS.
+fn host_bridge_open(path: &[u8], flags: i32, mode: u32) -> Option<Result<i32, i64>> {
+    // Guest flag bits match Linux `O_*`; carry blocking mode across and
+    // never let the slave become our controlling terminal here (the guest
+    // claims it explicitly with `TIOCSCTTY` after `setsid`).
+    let mut oflags = libc::O_RDWR | libc::O_NOCTTY;
+    if flags & libc::O_NONBLOCK != 0 {
+        oflags |= libc::O_NONBLOCK;
+    }
+    if flags & libc::O_CLOEXEC != 0 {
+        oflags |= libc::O_CLOEXEC;
+    }
+    if path == b"/dev/ptmx" {
+        let fd = unsafe { libc::posix_openpt(oflags) };
+        if fd < 0 {
+            return Some(Err(last_errno()));
+        }
+        if unsafe { libc::grantpt(fd) } != 0 || unsafe { libc::unlockpt(fd) } != 0 {
+            unsafe { libc::close(fd) };
+            return Some(Err(last_errno()));
+        }
+        return Some(Ok(fd));
+    }
+    if let Some(rest) = path.strip_prefix(b"/dev/pts/") {
+        if rest.is_empty() || !rest.iter().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    } else if matches!(path, b"/dev/urandom" | b"/dev/random") {
+        // Entropy is read-only; there is nothing meaningful to write.
+        if flags & 0o3 != 0 {
+            return Some(Err(libc::EPERM as i64));
+        }
+        oflags = libc::O_RDONLY | libc::O_NOCTTY;
+        if flags & libc::O_CLOEXEC != 0 {
+            oflags |= libc::O_CLOEXEC;
+        }
+    } else if path == b"/winserv" || path.starts_with(b"/winserv/") {
+        use std::os::unix::ffi::OsStrExt;
+        let host = winserv_host_path(path)?;
+        // The namespace is created on demand: guests mkdir it in their own
+        // VFS (a per-process shadow), so the host side must not depend on
+        // any guest having created it first.
+        if let Some(root) = root() {
+            let _ = std::fs::create_dir_all(root.join("winserv/clients"));
+        }
+        if flags & libc::O_CREAT != 0 {
+            if let Some(parent) = host.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let cpath = std::ffi::CString::new(host.as_os_str().as_bytes()).ok()?;
+        // Guest O_* bits match the host's, so they pass straight through
+        // (O_CREAT/O_TRUNC/O_APPEND/O_DIRECTORY included); O_NOCTTY is a
+        // no-op on these files but keeps pty semantics out of the shared
+        // namespace. The mode travels too: without it an O_CREAT open
+        // invents permissions from whatever vararg slot the host reads.
+        let oflags = flags | libc::O_NOCTTY;
+        let fd = if flags & libc::O_CREAT != 0 {
+            unsafe { libc::open(cpath.as_ptr(), oflags, mode as libc::mode_t) }
+        } else {
+            unsafe { libc::open(cpath.as_ptr(), oflags) }
+        };
+        if fd < 0 {
+            return Some(Err(last_errno()));
+        }
+        return Some(Ok(fd));
+    } else if !matches!(
+        path,
+        b"/etc/resolv.conf" | b"/etc/hosts" | b"/etc/nsswitch.conf" | b"/etc/services"
+    ) {
+        return None;
+    } else {
+        // Resolver configuration is bridged read-only: a guest must never
+        // rewrite the host's network configuration through this hole.
+        oflags = libc::O_RDONLY | libc::O_NOCTTY;
+        if flags & libc::O_CLOEXEC != 0 {
+            oflags |= libc::O_CLOEXEC;
+        }
+    }
+    let cpath = std::ffi::CString::new(path).ok()?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), oflags) };
+    if fd < 0 {
+        return Some(Err(last_errno()));
+    }
+    Some(Ok(fd))
+}
+
+/// Maps a guest `/winserv/...` path onto the host rootfs, or `None` when
+/// the path is outside the namespace or no rootfs is configured.
+///
+/// Bridged: the directory itself, `server.pid`, the `clients` directory,
+/// and `clients/<pid>`. Anything else (deeper paths, `..`) stays in the
+/// guest VFS, so a guest cannot use this hole to reach the rest of the
+/// rootfs.
+fn winserv_host_path(path: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let root = root()?;
+    let mut base = root.to_path_buf();
+    base.push("winserv");
+    if path == b"/winserv" {
+        return Some(base);
+    }
+    let rel = path.strip_prefix(b"/winserv/")?;
+    if rel == b"server.pid" || rel == b"clients" {
+        base.push(std::ffi::OsStr::from_bytes(rel));
+        return Some(base);
+    }
+    let name = rel.strip_prefix(b"clients/")?;
+    if name.is_empty() || name.contains(&b'/') || name.contains(&b'\0') {
+        return None;
+    }
+    base.push("clients");
+    base.push(std::ffi::OsStr::from_bytes(name));
+    Some(base)
+}
+
 /// Opens a pseudo-terminal master. Returns the host fd, or -1 on error.
 pub fn openpt() -> i32 {
     unsafe {
@@ -1089,6 +1235,23 @@ pub fn tcsetattr(fd: i32, attrs: &[u8]) -> i32 {
 /// Generic ioctl wrapper.
 pub fn ioctl(fd: i32, request: u64, arg: u64) -> i32 {
     unsafe { libc::ioctl(fd, request as libc::c_ulong, arg as libc::c_ulong) }
+}
+
+/// Sets the foreground process group (`tcsetpgrp` job control).
+pub fn tcsetpgrp(fd: i32, pgid: u32) -> i32 {
+    unsafe { libc::tcsetpgrp(fd, pgid as libc::pid_t) }
+}
+
+/// Gets the foreground process group (`tcgetpgrp` job control).
+pub fn tcgetpgrp(fd: i32) -> i32 {
+    unsafe {
+        let pgid = libc::tcgetpgrp(fd);
+        if pgid < 0 {
+            -1
+        } else {
+            pgid
+        }
+    }
 }
 
 /// Gets window size (TIOCGWINSZ).
@@ -1172,6 +1335,25 @@ unsafe fn read_guest_argv(mut ptr: u64) -> Result<Vec<Vec<u8>>, i64> {
             return Err(libc::E2BIG as i64);
         }
     }
+}
+
+/// Queues scripted input events for the guest under test.
+///
+/// Reads an `oscore::inject` script from `path` and appends every event to
+/// the guest input queue. Used for headless interaction tests
+/// (`MYOS_INJECT`); with no display server these are the only events the
+/// guest will ever see. Returns the event count.
+pub fn inject_file(path: &Path) -> Result<usize, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let events =
+        oscore::inject::parse_script(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let n = events.len();
+    let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
+    for e in events {
+        g.input.push(e);
+    }
+    Ok(n)
 }
 
 /// Configures the host directory that backs the guest's `/`.
@@ -1264,6 +1446,147 @@ fn exec_trampoline(guest: &[u8], host: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]
     }
 }
 
+/// Copies a guest `sockaddr` into a kernel buffer, bounding it to
+/// `sockaddr_storage` so a wild length cannot exhaust host memory.
+///
+/// Returns the bytes plus the length to hand the host, or `None` for an
+/// unreadable pointer or an oversized length.
+fn read_sockaddr(ptr: u64, len: u64) -> Option<(Vec<u8>, libc::socklen_t)> {
+    if ptr == 0 || len == 0 || len > 128 {
+        return None;
+    }
+    let bytes = unsafe { regs::read_guest(ptr, len as usize) }?;
+    Some((bytes, len as libc::socklen_t))
+}
+
+/// Maximum `iovec` entries marshalled for one `sendmsg`/`recvmsg`.
+const MAX_IOV: usize = 16;
+
+/// Relays `sendmsg`/`recvmsg` to the host, marshalling the `msghdr` and
+/// every `iovec` through kernel copies.
+///
+/// The x86-64 guest layout is parsed by offset (`name` 0..8, `namelen`
+/// 8..12, `iov` 16..24, `iovlen` 24..32, `control` 32..40, `controllen`
+/// 40..48, `flags` 48..52), so no struct transmute can drift from the
+/// ABI. Returns the byte count, or a raw errno on failure.
+fn relay_msghdr(host: i32, is_send: bool, msg_ptr: u64, flags: c_int) -> Result<i64, i64> {
+    let raw = unsafe { regs::read_guest(msg_ptr, 56) }.ok_or(libc::EFAULT as i64)?;
+    let p = |at: usize| u64::from_ne_bytes(raw[at..at + 8].try_into().unwrap());
+    let w = |at: usize| u32::from_ne_bytes(raw[at..at + 4].try_into().unwrap());
+    let name_ptr = p(0);
+    let name_len = w(8) as usize;
+    let iov_ptr = p(16);
+    let iov_len = p(24) as usize;
+    let ctl_ptr = p(32);
+    let ctl_len = p(40) as usize;
+    if iov_len > MAX_IOV || name_len > 128 || ctl_len > 4096 {
+        return Err(libc::EINVAL as i64);
+    }
+    let name = if name_ptr != 0 && name_len > 0 {
+        unsafe { regs::read_guest(name_ptr, name_len) }.ok_or(libc::EFAULT as i64)?
+    } else {
+        Vec::new()
+    };
+    let mut iovs: Vec<(u64, usize)> = Vec::with_capacity(iov_len);
+    for i in 0..iov_len {
+        let ent = unsafe { regs::read_guest(iov_ptr + (i * 16) as u64, 16) }
+            .ok_or(libc::EFAULT as i64)?;
+        let base = u64::from_ne_bytes(ent[0..8].try_into().unwrap());
+        let len = u64::from_ne_bytes(ent[8..16].try_into().unwrap()) as usize;
+        iovs.push((base, len));
+    }
+    if is_send {
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(iov_len);
+        for (base, len) in &iovs {
+            bufs.push(unsafe { regs::read_guest(*base, *len) }.ok_or(libc::EFAULT as i64)?);
+        }
+        let mut host_iov: Vec<libc::iovec> = bufs
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        let mut ctl = if ctl_ptr != 0 && ctl_len > 0 {
+            unsafe { regs::read_guest(ctl_ptr, ctl_len) }.ok_or(libc::EFAULT as i64)?
+        } else {
+            Vec::new()
+        };
+        let msg = libc::msghdr {
+            msg_name: if name.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                name.as_ptr() as *mut c_void
+            },
+            msg_namelen: name.len() as libc::socklen_t,
+            msg_iov: host_iov.as_mut_ptr(),
+            msg_iovlen: host_iov.len(),
+            msg_control: if ctl.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                ctl.as_mut_ptr() as *mut c_void
+            },
+            msg_controllen: ctl.len(),
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::sendmsg(host, &msg, flags) };
+        if n < 0 {
+            return Err(last_errno());
+        }
+        Ok(n as i64)
+    } else {
+        let mut bufs: Vec<Vec<u8>> = iovs.iter().map(|(_, len)| vec![0u8; *len]).collect();
+        let mut host_iov: Vec<libc::iovec> = bufs
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        let mut ctl = vec![0u8; ctl_len];
+        let mut name = name;
+        let name_len_in = name.len();
+        let mut msg = libc::msghdr {
+            msg_name: if name.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                name.as_mut_ptr() as *mut c_void
+            },
+            msg_namelen: name_len_in as libc::socklen_t,
+            msg_iov: host_iov.as_mut_ptr(),
+            msg_iovlen: host_iov.len(),
+            msg_control: if ctl.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                ctl.as_mut_ptr() as *mut c_void
+            },
+            msg_controllen: ctl.len(),
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::recvmsg(host, &mut msg, flags) };
+        if n < 0 {
+            return Err(last_errno());
+        }
+        for (i, (base, _)) in iovs.iter().enumerate() {
+            unsafe { regs::write_guest(*base, &bufs[i]) };
+        }
+        if ctl_ptr != 0 && !ctl.is_empty() {
+            unsafe { regs::write_guest(ctl_ptr, &ctl[..ctl.len().min(msg.msg_controllen)]) };
+        }
+        Ok(n as i64)
+    }
+}
+
+/// Whether a guest descriptor is the input event stream.
+///
+/// The stream is read like a file (`read` drains queued records, `poll`
+/// reports readability); only the trap layer can answer, because the pure
+/// dispatcher never sees host-backed descriptors.
+fn is_input_fd(fd: u32) -> bool {
+    let g = state().lock().unwrap_or_else(|p| p.into_inner());
+    matches!(g.fds.get(Fd(fd)), Ok(FdKind::Input))
+}
+
 /// The host fd behind a guest descriptor, if it is host-backed.
 ///
 /// Standard streams and pipes live in the host; VFS files return `None` and are
@@ -1330,6 +1653,36 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             regs::set_return(uc, 0);
             true
         }
+        // Session and process-group identity. Like `kill`, only the guest
+        // itself is addressable: pid/pgid 0 means "mine", anything else is
+        // `ESRCH`. The host call is the implementation; a terminal's
+        // `setsid` + `TIOCSCTTY` + `tcsetpgrp` sequence depends on it.
+        SYS_SETSID => {
+            let r = unsafe { libc::setsid() };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { r as i64 });
+            true
+        }
+        SYS_GETPGRP => {
+            regs::set_return(uc, unsafe { libc::getpgrp() } as i64);
+            true
+        }
+        SYS_SETPGID | SYS_GETPGID | SYS_GETSID => {
+            let pid = regs_in.arg(0) as i32;
+            let me = unsafe { libc::getpid() } as i32;
+            if pid != 0 && pid != me {
+                regs::set_return(uc, -(libc::ESRCH as i64));
+                return true;
+            }
+            let r = unsafe {
+                match regs_in.nr {
+                    SYS_SETPGID => libc::setpgid(pid, regs_in.arg(1) as libc::pid_t) as i64,
+                    SYS_GETPGID => libc::getpgid(pid) as i64,
+                    _ => libc::getsid(pid) as i64,
+                }
+            };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { r });
+            true
+        }
         // glibc's `fork` issues a fork-like `clone` (no new stack) rather than
         // the legacy `fork` syscall, so both are serviced the same way.
         SYS_CLONE => {
@@ -1392,7 +1745,28 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
         SYS_READ => {
             let fd = regs_in.arg(0) as u32;
             let Some(host) = host_fd_of(fd) else {
-                return false;
+                // The input stream is an `FdKind::Input`, not a host fd:
+                // drain queued event records into the guest buffer, the
+                // same bytes `SYS_INPUT_READ` would hand out. Without this
+                // every guest `read()` on the input fd fails with EBADF.
+                if !is_input_fd(fd) {
+                    return false;
+                }
+                let buf = regs_in.arg(1);
+                let len = regs_in.arg(2) as usize;
+                if len == 0 {
+                    regs::set_return(uc, 0);
+                    return true;
+                }
+                let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+                let mut tmp = vec![0u8; len.min(1 << 20)];
+                let n = st.input.read_into(&mut tmp);
+                drop(st);
+                if n > 0 {
+                    unsafe { regs::write_guest(buf, &tmp[..n]) };
+                }
+                regs::set_return(uc, n as i64);
+                return true;
             };
             let buf = regs_in.arg(1);
             let len = regs_in.arg(2) as usize;
@@ -1443,6 +1817,111 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             let r = unsafe { libc::close(host) };
             regs::set_return(uc, if r < 0 { -last_errno() } else { 0 });
             true
+        }
+        SYS_FSTAT => {
+            // Host-backed descriptors (pipes, sockets, bridged files and
+            // directories) stat through the host. The bytes follow the same
+            // 144-byte layout `oscore::vfs::Stat::to_bytes` produces, so a
+            // guest cannot tell which side of the trap its file lives on.
+            // (That layout omits `st_rdev`; both writers agree, which is
+            // what matters here.)
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let out = regs_in.arg(1);
+            if out == 0 {
+                regs::set_return(uc, -(libc::EFAULT as i64));
+                return true;
+            }
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(host, &mut st) } != 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            let mut buf = [0u8; 144];
+            let mut put = |at: usize, bytes: &[u8]| {
+                buf[at..at + bytes.len()].copy_from_slice(bytes);
+            };
+            put(0, &(st.st_dev as u64).to_le_bytes());
+            put(8, &(st.st_ino as u64).to_le_bytes());
+            put(16, &(st.st_nlink as u64).to_le_bytes());
+            put(24, &(st.st_mode as u32).to_le_bytes());
+            put(28, &(st.st_uid as u32).to_le_bytes());
+            put(32, &(st.st_gid as u32).to_le_bytes());
+            put(36, &0u32.to_le_bytes());
+            put(40, &(st.st_size as u64).to_le_bytes());
+            put(48, &(st.st_blksize as u64).to_le_bytes());
+            put(56, &(st.st_blocks as u64).to_le_bytes());
+            put(64, &(st.st_atime as i64).to_le_bytes());
+            put(72, &(st.st_atime_nsec as i64).to_le_bytes());
+            put(80, &(st.st_mtime as i64).to_le_bytes());
+            put(88, &(st.st_mtime_nsec as i64).to_le_bytes());
+            put(96, &(st.st_ctime as i64).to_le_bytes());
+            put(104, &(st.st_ctime_nsec as i64).to_le_bytes());
+            unsafe { regs::write_guest(out, &buf) };
+            regs::set_return(uc, 0);
+            true
+        }
+        SYS_GETDENTS => {
+            // Host-backed directory fds (the shared `/winserv` namespace)
+            // list through the host: `linux_dirent64` is the same layout on
+            // both sides, so the bytes copy straight across. VFS files fall
+            // through to the dispatcher.
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let buf = regs_in.arg(1);
+            let len = regs_in.arg(2) as usize;
+            if len == 0 {
+                regs::set_return(uc, -(libc::EINVAL as i64));
+                return true;
+            }
+            let mut tmp = vec![0u8; len.min(1 << 20)];
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, host, tmp.as_mut_ptr(), tmp.len()) };
+            if n < 0 {
+                regs::set_return(uc, -last_errno());
+            } else {
+                let n = n as usize;
+                unsafe { regs::write_guest(buf, &tmp[..n]) };
+                regs::set_return(uc, n as i64);
+            }
+            true
+        }
+        SYS_UNLINK | SYS_UNLINKAT => {
+            // Removals inside the shared namespace hit the host; everything
+            // else is VFS business for the dispatcher.
+            let path_ptr = if regs_in.nr == SYS_UNLINK {
+                regs_in.arg(0)
+            } else {
+                regs_in.arg(1)
+            };
+            let path = unsafe { regs::read_cstr_guest(path_ptr, 4096) };
+            let bridged = path
+                .as_deref()
+                .and_then(winserv_host_path)
+                .filter(|p| {
+                    // Only files go through here; the namespace directories
+                    // themselves are never unlinked by guests.
+                    !p.ends_with("winserv") && !p.ends_with("clients")
+                });
+            match bridged {
+                None => false,
+                Some(host) => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let cpath = match std::ffi::CString::new(host.as_os_str().as_bytes()) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            regs::set_return(uc, -(libc::EINVAL as i64));
+                            return true;
+                        }
+                    };
+                    let r = unsafe { libc::unlink(cpath.as_ptr()) };
+                    regs::set_return(uc, if r < 0 { -last_errno() } else { 0 });
+                    true
+                }
+            }
         }
         SYS_DUP | SYS_DUP2 | SYS_DUP3 => {
             let old = regs_in.arg(0) as u32;
@@ -1564,6 +2043,392 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             }
             true
         }
+        SYS_OPEN | SYS_OPENAT => {
+            // Bridged device opens: `/dev/pts/N` and `/dev/ptmx` live on the
+            // host, not in the guest VFS. `ptsname()` hands the guest a host
+            // path, so without this bridge every pty slave `open()` would
+            // fail with ENOENT and no terminal could ever spawn its shell.
+            // Anything else falls through to the VFS dispatcher.
+            let path_ptr = if regs_in.nr == SYS_OPEN {
+                regs_in.arg(0)
+            } else {
+                regs_in.arg(1)
+            };
+            let flags = if regs_in.nr == SYS_OPEN {
+                regs_in.arg(1) as i32
+            } else {
+                regs_in.arg(2) as i32
+            };
+            let mode = if regs_in.nr == SYS_OPEN {
+                regs_in.arg(2) as u32
+            } else {
+                regs_in.arg(3) as u32
+            };
+            let path = unsafe { regs::read_cstr_guest(path_ptr, 4096) };
+            match path
+                .as_deref()
+                .and_then(|p| host_bridge_open(p, flags, mode))
+            {
+                None => false,
+                Some(Ok(host_fd)) => {
+                    let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+                    let n = st.fds.alloc_host(host_fd);
+                    regs::set_return(uc, n.0 as i64);
+                    true
+                }
+                Some(Err(errno)) => {
+                    regs::set_return(uc, -(errno as i64));
+                    true
+                }
+            }
+        }
+        // Sockets are host kernel objects, like pipes: the guest's fd names
+        // a host fd (`FdKind::Host`), and every address/option buffer is
+        // marshalled through kernel-side copies so a bad guest pointer is
+        // an errno rather than a host fault. `read`/`write`/`close`/`poll`
+        // already serve host fds, so a connected socket is usable with no
+        // further work. The pure dispatcher answers these with `Nosys`;
+        // only this trap layer can own host descriptors.
+        SYS_SOCKET => {
+            let r = unsafe {
+                libc::socket(
+                    regs_in.arg(0) as c_int,
+                    regs_in.arg(1) as c_int,
+                    regs_in.arg(2) as c_int,
+                )
+            };
+            if r < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+            let n = st.fds.alloc_host(r);
+            regs::set_return(uc, n.0 as i64);
+            true
+        }
+        SYS_CONNECT | SYS_BIND | SYS_LISTEN | SYS_SHUTDOWN => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let r = unsafe {
+                match regs_in.nr {
+                    SYS_CONNECT => {
+                        let (addr, len) = match read_sockaddr(regs_in.arg(1), regs_in.arg(2)) {
+                            Some(a) => a,
+                            None => {
+                                regs::set_return(uc, -(libc::EINVAL as i64));
+                                return true;
+                            }
+                        };
+                        libc::connect(
+                            host,
+                            addr.as_ptr() as *const libc::sockaddr,
+                            len,
+                        )
+                    }
+                    SYS_BIND => {
+                        let (addr, len) = match read_sockaddr(regs_in.arg(1), regs_in.arg(2)) {
+                            Some(a) => a,
+                            None => {
+                                regs::set_return(uc, -(libc::EINVAL as i64));
+                                return true;
+                            }
+                        };
+                        libc::bind(host, addr.as_ptr() as *const libc::sockaddr, len)
+                    }
+                    SYS_LISTEN => libc::listen(host, regs_in.arg(1) as c_int),
+                    _ => libc::shutdown(host, regs_in.arg(1) as c_int),
+                }
+            };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { r as i64 });
+            true
+        }
+        SYS_ACCEPT => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let addr_ptr = regs_in.arg(1);
+            let len_ptr = regs_in.arg(2);
+            let mut len: libc::socklen_t = 128;
+            if addr_ptr != 0 && len_ptr != 0 {
+                match unsafe { regs::read_guest(len_ptr, 4) } {
+                    Some(b) => {
+                        len = u32::from_ne_bytes(b.try_into().unwrap()).min(128);
+                    }
+                    None => {
+                        regs::set_return(uc, -(libc::EFAULT as i64));
+                        return true;
+                    }
+                }
+            }
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::accept(
+                    host,
+                    &mut addr as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                )
+            };
+            if r < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            if addr_ptr != 0 && len_ptr != 0 {
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(&addr as *const _ as *const u8, len as usize)
+                };
+                unsafe { regs::write_guest(addr_ptr, bytes) };
+                unsafe { regs::write_guest(len_ptr, &len.to_ne_bytes()) };
+            }
+            let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+            let n = st.fds.alloc_host(r);
+            regs::set_return(uc, n.0 as i64);
+            true
+        }
+        SYS_GETSOCKNAME | SYS_GETPEERNAME => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let addr_ptr = regs_in.arg(1);
+            let len_ptr = regs_in.arg(2);
+            if addr_ptr == 0 || len_ptr == 0 {
+                regs::set_return(uc, -(libc::EFAULT as i64));
+                return true;
+            }
+            let mut len: libc::socklen_t = match unsafe { regs::read_guest(len_ptr, 4) } {
+                Some(b) => u32::from_ne_bytes(b.try_into().unwrap()).min(128),
+                None => {
+                    regs::set_return(uc, -(libc::EFAULT as i64));
+                    return true;
+                }
+            };
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                if regs_in.nr == SYS_GETSOCKNAME {
+                    libc::getsockname(host, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
+                } else {
+                    libc::getpeername(host, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
+                }
+            };
+            if r < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(&addr as *const _ as *const u8, len as usize)
+            };
+            unsafe { regs::write_guest(addr_ptr, bytes) };
+            unsafe { regs::write_guest(len_ptr, &len.to_ne_bytes()) };
+            regs::set_return(uc, 0);
+            true
+        }
+        SYS_SETSOCKOPT => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let optval = match unsafe { regs::read_guest(regs_in.arg(3), regs_in.arg(4) as usize) } {
+                Some(v) => v,
+                None => {
+                    regs::set_return(uc, -(libc::EFAULT as i64));
+                    return true;
+                }
+            };
+            let r = unsafe {
+                libc::setsockopt(
+                    host,
+                    regs_in.arg(1) as c_int,
+                    regs_in.arg(2) as c_int,
+                    optval.as_ptr() as *const c_void,
+                    optval.len() as libc::socklen_t,
+                )
+            };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { 0 });
+            true
+        }
+        SYS_GETSOCKOPT => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let opt_ptr = regs_in.arg(3);
+            let len_ptr = regs_in.arg(4);
+            if opt_ptr == 0 || len_ptr == 0 {
+                regs::set_return(uc, -(libc::EFAULT as i64));
+                return true;
+            }
+            let mut len: libc::socklen_t = match unsafe { regs::read_guest(len_ptr, 4) } {
+                Some(b) => u32::from_ne_bytes(b.try_into().unwrap()).min(128),
+                None => {
+                    regs::set_return(uc, -(libc::EFAULT as i64));
+                    return true;
+                }
+            };
+            let mut buf = vec![0u8; len as usize];
+            let r = unsafe {
+                libc::getsockopt(
+                    host,
+                    regs_in.arg(1) as c_int,
+                    regs_in.arg(2) as c_int,
+                    buf.as_mut_ptr() as *mut c_void,
+                    &mut len,
+                )
+            };
+            if r < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            buf.truncate(len as usize);
+            unsafe { regs::write_guest(opt_ptr, &buf) };
+            unsafe { regs::write_guest(len_ptr, &len.to_ne_bytes()) };
+            regs::set_return(uc, 0);
+            true
+        }
+        SYS_SENDTO => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let data = match unsafe { regs::read_guest(regs_in.arg(1), regs_in.arg(2) as usize) } {
+                Some(d) => d,
+                None => {
+                    regs::set_return(uc, -(libc::EFAULT as i64));
+                    return true;
+                }
+            };
+            let r = unsafe {
+                if regs_in.arg(4) == 0 {
+                    libc::send(
+                        host,
+                        data.as_ptr() as *const c_void,
+                        data.len(),
+                        regs_in.arg(3) as c_int,
+                    )
+                } else {
+                    let (addr, len) = match read_sockaddr(regs_in.arg(4), regs_in.arg(5)) {
+                        Some(a) => a,
+                        None => {
+                            regs::set_return(uc, -(libc::EINVAL as i64));
+                            return true;
+                        }
+                    };
+                    libc::sendto(
+                        host,
+                        data.as_ptr() as *const c_void,
+                        data.len(),
+                        regs_in.arg(3) as c_int,
+                        addr.as_ptr() as *const libc::sockaddr,
+                        len,
+                    )
+                }
+            };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { r as i64 });
+            true
+        }
+        SYS_RECVFROM => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let len = regs_in.arg(2) as usize;
+            let addr_ptr = regs_in.arg(4);
+            let addr_len_ptr = regs_in.arg(5);
+            let mut tmp = vec![0u8; len.min(1 << 20)];
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut addrlen: libc::socklen_t = 128;
+            let n = unsafe {
+                libc::recvfrom(
+                    host,
+                    tmp.as_mut_ptr() as *mut c_void,
+                    tmp.len(),
+                    regs_in.arg(3) as c_int,
+                    if addr_ptr != 0 {
+                        &mut addr as *mut _ as *mut libc::sockaddr
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                    if addr_ptr != 0 && addr_len_ptr != 0 {
+                        &mut addrlen
+                    } else {
+                        std::ptr::null_mut()
+                    },
+                )
+            };
+            if n < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            unsafe { regs::write_guest(regs_in.arg(1), &tmp[..n as usize]) };
+            if addr_ptr != 0 && addr_len_ptr != 0 {
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        &addr as *const _ as *const u8,
+                        (addrlen as usize).min(128),
+                    )
+                };
+                unsafe { regs::write_guest(addr_ptr, bytes) };
+                unsafe { regs::write_guest(addr_len_ptr, &addrlen.to_ne_bytes()) };
+            }
+            regs::set_return(uc, n as i64);
+            true
+        }
+        SYS_SENDMSG | SYS_RECVMSG => {
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            match relay_msghdr(host, regs_in.nr == SYS_SENDMSG, regs_in.arg(1), regs_in.arg(2) as c_int) {
+                Ok(n) => regs::set_return(uc, n),
+                Err(e) => regs::set_return(uc, -e),
+            }
+            true
+        }
+        SYS_SOCKETPAIR => {
+            let mut pair = [0i32; 2];
+            let r = unsafe {
+                libc::socketpair(
+                    regs_in.arg(0) as c_int,
+                    regs_in.arg(1) as c_int,
+                    regs_in.arg(2) as c_int,
+                    pair.as_mut_ptr(),
+                )
+            };
+            if r < 0 {
+                regs::set_return(uc, -last_errno());
+                return true;
+            }
+            let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
+            let a = st.fds.alloc_host(pair[0]);
+            let b = st.fds.alloc_host(pair[1]);
+            drop(st);
+            // The guest's `int fds[2]` receives guest descriptor numbers.
+            let mut out = Vec::new();
+            out.extend_from_slice(&a.0.to_ne_bytes());
+            out.extend_from_slice(&b.0.to_ne_bytes());
+            if unsafe { !regs::write_guest(regs_in.arg(3), &out) } {
+                regs::set_return(uc, -(libc::EFAULT as i64));
+                return true;
+            }
+            regs::set_return(uc, 0);
+            true
+        }
+        SYS_FCNTL => {
+            // Only host-backed descriptors (pipes, sockets, stdio) reach the
+            // host; VFS files fall through to the dispatcher. The address
+            // space is shared, so pointer arguments are passed straight
+            // through.
+            let fd = regs_in.arg(0) as u32;
+            let Some(host) = host_fd_of(fd) else {
+                return false;
+            };
+            let cmd = regs_in.arg(1) as c_int;
+            let r = unsafe { libc::fcntl(host, cmd, regs_in.arg(2)) };
+            regs::set_return(uc, if r < 0 { -last_errno() } else { r as i64 });
+            true
+        }
         SYS_EXECVE => {
             let path = unsafe { regs::read_cstr_guest(regs_in.arg(0), 4096) };
             let argv = unsafe { read_guest_argv(regs_in.arg(1)) };
@@ -1644,6 +2509,10 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         return;
     }
 
+    // Pump host input events before servicing the syscall, so a guest that
+    // polls the input fd (rather than parking in input_wait) sees them.
+    pump_input();
+
     let mut mem = HostMemory;
 
     let (result, out, present, exit, guest_fs, sleep, parked) = {
@@ -1699,6 +2568,8 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
             pty_ioctl: _,
             pty_winsz_get: _,
             pty_winsz_set: _,
+            pty_setpgrp: _,
+            pty_getpgrp: _,
             memfd_create: _,
             shm_open: _,
             shm_unlink: _,
@@ -1737,15 +2608,15 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
             pty_ioctl: Some(ioctl),
             pty_winsz_get: Some(tiocgwinsz),
             pty_winsz_set: Some(tiocswinsz),
+            pty_setpgrp: Some(tcsetpgrp),
+            pty_getpgrp: Some(tcgetpgrp),
             memfd_create: Some(memfd_create),
             shm_open: Some(shm_open),
             shm_unlink: Some(shm_unlink),
         };
-        // A `present` is one composited frame; the counter lets a guest that is
-        // redrawing in a loop keep a steady cadence.
-        if !gs.frame.is_empty() {
-            gs.frame_counter += 1;
-        }
+        // Frame pacing is owned by the dispatcher: `DISPLAY_PRESENT`
+        // increments `frame_counter` when it composites. Counting here as
+        // well would double-count every present.
         let r = dispatch(&regs_in, &mut mem, &mut gs, fds);
         *exited = gs.exited;
         *brk = gs.brk;

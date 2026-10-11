@@ -721,10 +721,37 @@ impl Display {
         Ok(())
     }
 
+    /// Gives input focus to one window, clearing it from all others.
+    ///
+    /// Focus is what decides where routed keyboard events go in Phase 2.2.
+    /// Focusing a minimized or invisible window is allowed: visibility
+    /// controls compositing, not event routing.
+    pub fn set_focus(&mut self, id: u32) -> Result<(), Errno> {
+        let i = self.index(id).ok_or(Errno::NoEnt)?;
+        for (k, w) in self.windows.iter_mut().enumerate() {
+            w.focused = k == i;
+        }
+        Ok(())
+    }
+
+    /// Which window currently has input focus, if any.
+    pub fn focused(&self) -> Option<u32> {
+        self.windows.iter().find(|w| w.focused).map(|w| w.id)
+    }
+
     /// Removes a window, returning its buffer address for unmapping.
     pub fn destroy(&mut self, id: u32) -> Result<u64, Errno> {
         let i = self.index(id).ok_or(Errno::NoEnt)?;
-        Ok(self.windows.remove(i).buffer)
+        let was_focused = self.windows[i].focused;
+        let buf = self.windows.remove(i).buffer;
+        // Destroying the focused window must not leave a dangling focus.
+        // Hand focus to the new topmost window, if one remains.
+        if was_focused {
+            if let Some(top) = self.windows.last_mut() {
+                top.focused = true;
+            }
+        }
+        Ok(buf)
     }
 
     /// Composites visible windows onto a fresh background surface.
@@ -1061,5 +1088,35 @@ mod tests {
         assert_eq!(w.width, 20);
         assert_eq!(w.height, 30);
         assert!(w.dirty, "resize should mark dirty");
+    }
+
+    #[test]
+    fn focus_moves_between_windows_and_follows_destroy() {
+        let mut d = Display::new(100, 100);
+        assert_eq!(d.focused(), None);
+        let a = d.create(10, 10).unwrap();
+        let b = d.create(10, 10).unwrap();
+        d.set_focus(a).unwrap();
+        assert_eq!(d.focused(), Some(a));
+        assert!(d.get(a).unwrap().focused);
+        assert!(!d.get(b).unwrap().focused);
+        d.set_focus(b).unwrap();
+        assert_eq!(d.focused(), Some(b));
+        assert_eq!(d.set_focus(999), Err(Errno::NoEnt));
+        // Destroying the focused window hands focus to the survivor.
+        d.destroy(b).unwrap();
+        assert_eq!(d.focused(), Some(a));
+    }
+
+    #[test]
+    fn set_title_stores_a_nul_terminated_name() {
+        let mut d = Display::new(100, 100);
+        let id = d.create(10, 10).unwrap();
+        d.set_title(id, "Terminal").unwrap();
+        let w = d.get(id).unwrap();
+        assert_eq!(w.title_len, 8);
+        assert_eq!(&w.title[..8], b"Terminal");
+        assert_eq!(w.title[8], 0);
+        assert_eq!(d.set_title(999, "x"), Err(Errno::NoEnt));
     }
 }

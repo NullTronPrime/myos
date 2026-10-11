@@ -20,4 +20,4 @@ echo "myos: starting desktop shell"
 echo ""
 
 export DISPLAY="${DISPLAY:-:0}"
-exec env MYOS_ROOT="$root" MYOS_DISPLAY=800x600 DISPLAY="$DISPLAY" "$myos" "$out/desktop_shell"
+exec env MYOS_ROOT="$root" MYOS_DISPLAY=800x600 MYOS_FB_OUT=target/frame_latest.ppm DISPLAY="$DISPLAY" "$myos" "$out/desktop_shell"

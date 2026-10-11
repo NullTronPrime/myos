@@ -44,7 +44,10 @@ pub const SYS_KILL: i64 = 62;
 pub const SYS_UNAME: i64 = 63;
 pub const SYS_FCNTL: i64 = 72;
 pub const SYS_FTRUNCATE: i64 = 77;
-pub const SYS_GETDENTS: i64 = 78;
+/// `getdents64`. Note this is 217, not 78 (`getdents`, which no x86-64
+/// libc emits): with the wrong number every guest directory listing
+/// silently misses, because glibc's `readdir` only ever issues 217.
+pub const SYS_GETDENTS: i64 = 217;
 pub const SYS_GETCWD: i64 = 79;
 pub const SYS_CHDIR: i64 = 80;
 pub const SYS_MKDIR: i64 = 83;
@@ -59,6 +62,14 @@ pub const SYS_GETGID: i64 = 104;
 pub const SYS_GETEUID: i64 = 107;
 pub const SYS_GETEGID: i64 = 108;
 pub const SYS_GETPPID: i64 = 110;
+/// Process-group and session syscalls, delegated to the host in `osplat`.
+/// Only the guest's own group is addressable (one guest per host process,
+// like `kill`); anything else reports `ESRCH`.
+pub const SYS_SETPGID: i64 = 109;
+pub const SYS_GETPGRP: i64 = 111;
+pub const SYS_SETSID: i64 = 112;
+pub const SYS_GETPGID: i64 = 121;
+pub const SYS_GETSID: i64 = 124;
 pub const SYS_ARCH_PRCTL: i64 = 158;
 pub const SYS_SET_TID_ADDRESS: i64 = 218;
 pub const SYS_CLOCK_GETTIME: i64 = 228;
@@ -75,7 +86,9 @@ pub const SYS_RENAMEAT: i64 = 264;
 pub const SYS_READLINKAT: i64 = 267;
 pub const SYS_FACCESSAT: i64 = 269;
 pub const SYS_PSELECT6: i64 = 270;
-pub const SYS_POLL: i64 = 271;
+/// `poll(2)`. Note this is 7, not 271 (`ppoll`); the two names look
+/// interchangeable but trap different guest syscalls.
+pub const SYS_POLL: i64 = 7;
 pub const SYS_SET_ROBUST_LIST: i64 = 273;
 pub const SYS_EPOLL_CREATE1: i64 = 291;
 pub const SYS_EPOLL_CTL: i64 = 233;
@@ -92,6 +105,14 @@ pub const SYS_TCSETATTR: i64 = 345;
 pub const SYS_IOCTL_TIOCSCTTY: i64 = 346;
 pub const SYS_IOCTL_TIOCGWINSZ: i64 = 347;
 pub const SYS_IOCTL_TIOCSWINSZ: i64 = 348;
+/// Sets the foreground process group (`tcsetpgrp`).
+pub const SYS_TCSETPGRP: i64 = 349;
+/// Reads the foreground process group (`tcgetpgrp`).
+pub const SYS_TCGETPGRP: i64 = 350;
+/// `TIOCSCTTY` request number: make this terminal the controlling terminal.
+/// Linux x86-64 value; `TCGETS` (`0x5401`) looks deceptively similar and must
+/// not be confused with it.
+pub const TIOCSCTTY: u64 = 0x540E;
 pub const SYS_MEMFD_CREATE: i64 = 352;
 pub const SYS_SHM_OPEN: i64 = 353;
 pub const SYS_SHM_UNLINK: i64 = 354;
@@ -115,7 +136,7 @@ pub const SYS_PRLIMIT64_NEW: i64 = 302;
 pub const SYS_RSEQ_NEW: i64 = 334;
 pub const SYS_UTIMENSAT: i64 = 280;
 pub const SYS_FALLOCATE: i64 = 285;
-pub const SYS_PPOLL: i64 = 288;
+pub const SYS_PPOLL: i64 = 271;
 pub const SYS_DUP3: i64 = 292;
 pub const SYS_PIPE2: i64 = 293;
 pub const SYS_PRLIMIT64: i64 = 302;
@@ -158,6 +179,24 @@ pub const SYS_DISPLAY_FRAME: i64 = 0x100f;
 pub const SYS_SYNC_FS: i64 = 0x1010;
 /// Which window has input focus.
 pub const SYS_WINDOW_FOCUS: i64 = 0x1011;
+/// Lists window ids back-to-front into a guest `u32` array.
+///
+/// `arg0` is the output pointer (0 to probe), `arg1` the capacity in ids.
+/// Returns the total window count; when the buffer is smaller, only the
+/// first `capacity` ids are written. This is what taskbars and Alt-Tab
+/// switchers enumerate.
+pub const SYS_DISPLAY_WINDOWS: i64 = 0x1013;
+/// Minimizes (toggles) a window; a minimized window is skipped by the
+/// compositor and hit-testing until toggled back.
+pub const SYS_WINDOW_MINIMIZE: i64 = 0x1014;
+/// Lowers a window below all others without destroying it.
+pub const SYS_WINDOW_LOWER: i64 = 0x1015;
+/// Reads a window's title as a NUL-terminated string.
+///
+/// `arg1` is the output pointer, `arg2` the capacity including the NUL.
+/// Returns the full title length (excluding NUL); longer titles are
+/// truncated. A zero capacity probes the length.
+pub const SYS_WINDOW_GET_TITLE: i64 = 0x1016;
 /// The descriptor to read input events from, allocated on first call.
 ///
 /// Input is a stream rather than a global so that a guest which loses interest
@@ -517,6 +556,10 @@ pub struct GuestState<'a> {
     pub pty_ioctl: Option<fn(i32, u64, u64) -> i32>,
     pub pty_winsz_get: Option<fn(i32) -> Vec<u8>>,
     pub pty_winsz_set: Option<fn(i32, &[u8]) -> i32>,
+    /// Sets the foreground process group (`tcsetpgrp` job control).
+    pub pty_setpgrp: Option<fn(i32, u32) -> i32>,
+    /// Reads the foreground process group (`tcgetpgrp` job control).
+    pub pty_getpgrp: Option<fn(i32) -> i32>,
     /// Platform-provided shared memory functions.
     pub memfd_create: Option<fn(&str, u32) -> i32>,
     pub shm_open: Option<fn(&str, u32) -> i32>,
@@ -1586,7 +1629,7 @@ pub fn dispatch<M: GuestMemory>(
             let Some(ioctl_fn) = state.pty_ioctl else { return Err(Errno::Nosys) };
             let fd = Fd(regs.arg(0) as u32);
             let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
-            if ioctl_fn(host, 0x5401, 0) != 0 { return Err(Errno::Perm); }
+            if ioctl_fn(host, TIOCSCTTY, 0) != 0 { return Err(Errno::Perm); }
             Ok(0)
         }
         SYS_IOCTL_TIOCGWINSZ => {
@@ -1606,6 +1649,22 @@ pub fn dispatch<M: GuestMemory>(
             let raw = mem.read(buf, 8)?;
             if winsz_set_fn(host, &raw) != 0 { return Err(Errno::Inval); }
             Ok(0)
+        }
+        SYS_TCSETPGRP => {
+            let Some(setpgrp_fn) = state.pty_setpgrp else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let pgid = regs.arg(1) as u32;
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            if setpgrp_fn(host, pgid) != 0 { return Err(Errno::Perm); }
+            Ok(0)
+        }
+        SYS_TCGETPGRP => {
+            let Some(getpgrp_fn) = state.pty_getpgrp else { return Err(Errno::Nosys) };
+            let fd = Fd(regs.arg(0) as u32);
+            let host = match fds.get(fd) { Ok(FdKind::Host(h)) => h, _ => return Err(Errno::Badf) };
+            let pgid = getpgrp_fn(host);
+            if pgid < 0 { return Err(Errno::Inval); }
+            Ok(pgid as u64)
         }
         SYS_MEMFD_CREATE => {
             let name_ptr = regs.ptr(0)?;
@@ -1920,7 +1979,84 @@ pub fn dispatch<M: GuestMemory>(
                     .collect())
             })?;
             state.frame = fb.to_ppm();
+            state.frame_counter = state.frame_counter.wrapping_add(1);
             Ok(state.frame.len() as u64)
+        }
+        SYS_WINDOW_QUERY => {
+            // Layout: x(i32) y(i32) w(u32) h(u32) z(u32) focused(u32) = 24 bytes.
+            let id = regs.arg(0) as u32;
+            let out = regs.ptr(1)?;
+            let win = *state.display.get(id).ok_or(Errno::NoEnt)?;
+            let mut buf = [0u8; 24];
+            buf[0..4].copy_from_slice(&(win.x).to_le_bytes());
+            buf[4..8].copy_from_slice(&(win.y).to_le_bytes());
+            buf[8..12].copy_from_slice(&win.width.to_le_bytes());
+            buf[12..16].copy_from_slice(&win.height.to_le_bytes());
+            buf[16..20].copy_from_slice(&win.z.to_le_bytes());
+            buf[20..24].copy_from_slice(&(u32::from(win.focused)).to_le_bytes());
+            mem.write(out, &buf)?;
+            Ok(0)
+        }
+        SYS_DISPLAY_WINDOW_AT => {
+            let x = regs.arg(0) as i32;
+            let y = regs.arg(1) as i32;
+            let id = state.display.hit_test(x, y).ok_or(Errno::NoEnt)?;
+            Ok(id as u64)
+        }
+        SYS_WINDOW_SET_TITLE => {
+            let id = regs.arg(0) as u32;
+            let p = regs.ptr(1)?;
+            let raw = mem.read_cstr(p)?;
+            let title = String::from_utf8_lossy(&raw);
+            state.display.set_title(id, &title)?;
+            Ok(0)
+        }
+        SYS_DISPLAY_FRAME => Ok(state.frame_counter),
+        SYS_DISPLAY_WINDOWS => {
+            let out = regs.arg(0);
+            let max = regs.arg(1) as usize;
+            let ids: Vec<u32> = state.display.windows().iter().map(|w| w.id).collect();
+            let n = ids.len().min(max);
+            if out != 0 && n > 0 {
+                let mut buf = Vec::with_capacity(n * 4);
+                for id in ids.iter().take(n) {
+                    buf.extend_from_slice(&id.to_le_bytes());
+                }
+                mem.write(out, &buf)?;
+            }
+            Ok(ids.len() as u64)
+        }
+        SYS_WINDOW_MINIMIZE => {
+            state.display.toggle_minimize(regs.arg(0) as u32)?;
+            Ok(0)
+        }
+        SYS_WINDOW_LOWER => {
+            state.display.lower(regs.arg(0) as u32)?;
+            Ok(0)
+        }
+        SYS_WINDOW_GET_TITLE => {
+            let id = regs.arg(0) as u32;
+            let out = regs.arg(1);
+            let cap = regs.arg(2) as usize;
+            let win = *state.display.get(id).ok_or(Errno::NoEnt)?;
+            let title = &win.title[..win.title_len as usize];
+            if out != 0 && cap > 0 {
+                let n = title.len().min(cap - 1);
+                let mut buf = vec![0u8; n + 1];
+                buf[..n].copy_from_slice(&title[..n]);
+                mem.write(out, &buf)?;
+            }
+            Ok(win.title_len as u64)
+        }
+        SYS_WINDOW_FOCUS => {
+            let id = regs.arg(0) as u32;
+            // u32::MAX queries the current focus without changing it, so a
+            // guest can discover who owns the keyboard before stealing it.
+            if id == u32::MAX {
+                return Ok(state.display.focused().unwrap_or(0) as u64);
+            }
+            state.display.set_focus(id)?;
+            Ok(id as u64)
         }
         SYS_WINDOW_DRAW_TEXT => {
             let id = regs.arg(0) as u32;
@@ -1994,6 +2130,8 @@ impl<'a> GuestState<'a> {
             pty_ioctl: None,
             pty_winsz_get: None,
             pty_winsz_set: None,
+            pty_setpgrp: None,
+            pty_getpgrp: None,
             memfd_create: None,
             shm_open: None,
             shm_unlink: None,
@@ -2611,6 +2749,36 @@ mod tests {
         for nr in [999i64, 1000, 4000] {
             let r = Registers::new(nr);
             assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Nosys));
+        }
+    }
+
+    #[test]
+    fn sockets_are_trap_delegated_not_dispatched() {
+        // Sockets own host kernel objects, so only `osplat::trap` (which can
+        // allocate host fds) serves them; the pure dispatcher answers
+        // `Nosys`, exactly like `fork`/`clone`.
+        let vfs: &'static mut Vfs = Box::leak(Box::new(Vfs::new()));
+        let mut s = GuestState::new(vfs);
+        let mut f = FdTable::new();
+        let mut g = SimGuest::new(64);
+        for nr in [
+            SYS_SOCKET,
+            SYS_CONNECT,
+            SYS_ACCEPT,
+            SYS_SENDTO,
+            SYS_RECVFROM,
+            SYS_SENDMSG,
+            SYS_RECVMSG,
+            SYS_SHUTDOWN,
+            SYS_BIND,
+            SYS_LISTEN,
+            SYS_SOCKETPAIR,
+        ] {
+            assert_eq!(
+                dispatch(&Registers::new(nr), &mut g, &mut s, &mut f),
+                Err(Errno::Nosys),
+                "syscall {nr} must stay trap-owned"
+            );
         }
     }
 
@@ -3433,5 +3601,201 @@ mod tests {
         let r = Registers::new(SYS_INPUT_WAIT).with_args([16_000_000, 0, 0, 0, 0, 0]);
         assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(1));
         assert!(!s.pending_input_wait);
+    }
+
+    #[test]
+    fn window_query_reports_position_focus_and_z() {
+        let (mut g, mut s, mut f) = harness(64);
+        let r = Registers::new(SYS_WINDOW_CREATE).with_args([20, 10, 0, 0, 0, 0]);
+        let id = dispatch(&r, &mut g, &mut s, &mut f).unwrap() as u32;
+        let r = Registers::new(SYS_WINDOW_MOVE).with_args([id as u64, 5, 7, 0, 0, 0]);
+        dispatch(&r, &mut g, &mut s, &mut f).unwrap();
+        let r =
+            Registers::new(SYS_WINDOW_QUERY).with_args([id as u64, 0x1000_1000, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        let raw = g.read(0x1000_1000, 24).unwrap();
+        assert_eq!(i32::from_le_bytes(raw[0..4].try_into().unwrap()), 5);
+        assert_eq!(i32::from_le_bytes(raw[4..8].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(raw[8..12].try_into().unwrap()), 20);
+        assert_eq!(u32::from_le_bytes(raw[12..16].try_into().unwrap()), 10);
+        assert_eq!(u32::from_le_bytes(raw[20..24].try_into().unwrap()), 0);
+        let r = Registers::new(SYS_WINDOW_QUERY).with_args([999, 0x1000_1000, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::NoEnt));
+    }
+
+    #[test]
+    fn display_window_at_routes_to_the_topmost_window() {
+        let (mut g, mut s, mut f) = harness(128);
+        let mk = |s: &mut GuestState<'static>, g: &mut SimGuest, f: &mut FdTable| {
+            let r = Registers::new(SYS_WINDOW_CREATE).with_args([10, 10, 0, 0, 0, 0]);
+            let id = dispatch(&r, g, s, f).unwrap() as u32;
+            // Map + show so hit-testing sees the window.
+            let r = Registers::new(SYS_WINDOW_MAP).with_args([id as u64, 0x1000_1000, 0, 0, 0, 0]);
+            dispatch(&r, g, s, f).unwrap();
+            let r = Registers::new(SYS_WINDOW_PRESENT).with_args([id as u64, 0, 0, 0, 0, 0]);
+            dispatch(&r, g, s, f).unwrap();
+            id
+        };
+        let a = mk(&mut s, &mut g, &mut f);
+        let b = mk(&mut s, &mut g, &mut f);
+        assert_ne!(a, b);
+        // Both at (0,0): the later window is on top.
+        let r = Registers::new(SYS_DISPLAY_WINDOW_AT).with_args([5, 5, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(b as u64));
+        let r = Registers::new(SYS_DISPLAY_WINDOW_AT).with_args([500, 500, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::NoEnt));
+    }
+
+    #[test]
+    fn window_set_title_focus_and_frame_counter() {
+        let (mut g, mut s, mut f) = harness(128);
+        let r = Registers::new(SYS_WINDOW_CREATE).with_args([10, 10, 0, 0, 0, 0]);
+        let id = dispatch(&r, &mut g, &mut s, &mut f).unwrap() as u32;
+        put_str(&mut g, 0x1000_1000, "Terminal");
+        let r =
+            Registers::new(SYS_WINDOW_SET_TITLE).with_args([id as u64, 0x1000_1000, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        assert_eq!(s.display.get(id).unwrap().title_len, 8);
+        let r = Registers::new(SYS_WINDOW_FOCUS).with_args([id as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(id as u64));
+        let r = Registers::new(SYS_WINDOW_FOCUS).with_args([u32::MAX as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(id as u64));
+        assert_eq!(
+            dispatch(
+                &Registers::new(SYS_DISPLAY_FRAME),
+                &mut g,
+                &mut s,
+                &mut f
+            ),
+            Ok(0)
+        );
+        // Presenting bumps the frame counter the pager reads back.
+        let r = Registers::new(SYS_WINDOW_MAP).with_args([id as u64, 0x1000_1100, 0, 0, 0, 0]);
+        dispatch(&r, &mut g, &mut s, &mut f).unwrap();
+        let r = Registers::new(SYS_DISPLAY_PRESENT).with_args([0, 0, 0, 0, 0, 0]);
+        dispatch(&r, &mut g, &mut s, &mut f).unwrap();
+        assert_eq!(
+            dispatch(
+                &Registers::new(SYS_DISPLAY_FRAME),
+                &mut g,
+                &mut s,
+                &mut f
+            ),
+            Ok(1)
+        );
+    }
+
+    fn stub_ioctl_capturing(_fd: i32, req: u64, _arg: u64) -> i32 {
+        assert_eq!(req, TIOCSCTTY, "controlling-terminal request number");
+        0
+    }
+
+    #[test]
+    fn tiocsctty_issues_the_controlling_terminal_request() {
+        let (mut g, mut s, mut f) = harness(64);
+        let r = Registers::new(SYS_IOCTL_TIOCSCTTY).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Nosys));
+        s.pty_ioctl = Some(stub_ioctl_capturing);
+        let r = Registers::new(SYS_IOCTL_TIOCSCTTY).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+    }
+
+    fn stub_setpgrp(_fd: i32, pgid: u32) -> i32 {
+        if pgid == 0 {
+            -1
+        } else {
+            0
+        }
+    }
+
+    fn stub_getpgrp(_fd: i32) -> i32 {
+        42
+    }
+
+    #[test]
+    fn tcsetpgrp_and_tcgetpgrp_round_trip_through_host_hooks() {
+        let (mut g, mut s, mut f) = harness(64);
+        // No hooks installed: the calls are unimplemented, not silently ok.
+        let r = Registers::new(SYS_TCSETPGRP).with_args([0, 42, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Nosys));
+        let r = Registers::new(SYS_TCGETPGRP).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Nosys));
+
+        s.pty_setpgrp = Some(stub_setpgrp);
+        s.pty_getpgrp = Some(stub_getpgrp);
+        // fd 0 is host-backed in a fresh table, so the hooks run.
+        let r = Registers::new(SYS_TCSETPGRP).with_args([0, 42, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        let r = Registers::new(SYS_TCSETPGRP).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Perm));
+        let r = Registers::new(SYS_TCGETPGRP).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(42));
+
+        // A VFS file is not a terminal.
+        let fd = open_file(&mut g, &mut s, &mut f, "/f");
+        let r = Registers::new(SYS_TCSETPGRP).with_args([fd, 42, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Badf));
+        let r = Registers::new(SYS_TCGETPGRP).with_args([fd, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::Badf));
+    }
+
+    #[test]
+    fn display_windows_lists_ids_back_to_front() {
+        let (mut g, mut s, mut f) = harness(64);
+        // Probing with no buffer reports the count.
+        let r = Registers::new(SYS_DISPLAY_WINDOWS).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        let mk = |g: &mut SimGuest, s: &mut GuestState<'static>, f: &mut FdTable| {
+            let r = Registers::new(SYS_WINDOW_CREATE).with_args([10, 10, 0, 0, 0, 0]);
+            dispatch(&r, g, s, f).unwrap() as u32
+        };
+        let a = mk(&mut g, &mut s, &mut f);
+        let b = mk(&mut g, &mut s, &mut f);
+        let r = Registers::new(SYS_DISPLAY_WINDOWS).with_args([0, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        let r =
+            Registers::new(SYS_DISPLAY_WINDOWS).with_args([0x1000_1000, 8, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        let raw = g.read(0x1000_1000, 8).unwrap();
+        assert_eq!(u32::from_le_bytes(raw[0..4].try_into().unwrap()), a);
+        assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), b);
+        // A short buffer truncates but still reports the total.
+        let r =
+            Registers::new(SYS_DISPLAY_WINDOWS).with_args([0x1000_1100, 1, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        let raw = g.read(0x1000_1100, 4).unwrap();
+        assert_eq!(u32::from_le_bytes(raw[0..4].try_into().unwrap()), a);
+    }
+
+    #[test]
+    fn minimize_lower_and_get_title() {
+        let (mut g, mut s, mut f) = harness(64);
+        let r = Registers::new(SYS_WINDOW_CREATE).with_args([10, 10, 0, 0, 0, 0]);
+        let id = dispatch(&r, &mut g, &mut s, &mut f).unwrap() as u32;
+        let r = Registers::new(SYS_WINDOW_MINIMIZE).with_args([id as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        assert!(s.display.get(id).unwrap().minimized);
+        let r = Registers::new(SYS_WINDOW_MINIMIZE).with_args([id as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        assert!(!s.display.get(id).unwrap().minimized);
+        let r = Registers::new(SYS_WINDOW_LOWER).with_args([id as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
+        let r = Registers::new(SYS_WINDOW_LOWER).with_args([999, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::NoEnt));
+        put_str(&mut g, 0x1000_1000, "Hi");
+        let r =
+            Registers::new(SYS_WINDOW_SET_TITLE).with_args([id as u64, 0x1000_1000, 0, 0, 0, 0]);
+        dispatch(&r, &mut g, &mut s, &mut f).unwrap();
+        // Length probe, then the title itself, then truncation.
+        let r = Registers::new(SYS_WINDOW_GET_TITLE).with_args([id as u64, 0, 0, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        let r = Registers::new(SYS_WINDOW_GET_TITLE).with_args([id as u64, 0x1000_1100, 16, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        assert_eq!(g.read(0x1000_1100, 3).unwrap(), b"Hi\0");
+        let r = Registers::new(SYS_WINDOW_GET_TITLE).with_args([id as u64, 0x1000_1200, 2, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(2));
+        assert_eq!(g.read(0x1000_1200, 2).unwrap(), b"H\0");
+        let r = Registers::new(SYS_WINDOW_GET_TITLE).with_args([999, 0x1000_1100, 16, 0, 0, 0]);
+        assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Err(Errno::NoEnt));
     }
 }

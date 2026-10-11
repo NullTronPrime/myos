@@ -182,19 +182,26 @@ fn main() {
                 eprintln!("myos: cannot re-arm syscall trap: {e}");
                 libc::_exit(120);
             }
+            if let Some(script) = std::env::var_os("MYOS_INJECT") {
+                match trap::inject_file(std::path::Path::new(&script)) {
+                    Ok(n) => eprintln!("myos: injected {n} input events"),
+                    Err(e) => {
+                        eprintln!("myos: inject failed: {e}");
+                        libc::_exit(121);
+                    }
+                }
+            }
             loader::enter(loaded.entry, loaded.stack_top);
         }
-
-        // Start the compositor loop in a background thread. This drives
-        // presentation at ~60fps, polling input and compositing dirty windows
-        // independently of guest `display_present` calls.
-        std::thread::spawn(|| {
-            osplat::display::compositor_loop();
-        });
 
         // The guest runs in a forked child so a crash cannot take the launcher
         // with it, and so the filter is installed only in the process it
         // applies to.
+        //
+        // Note: presentation happens inside the child's trap handler when the
+        // guest calls `display_present` (see `osplat::trap`). A compositor
+        // thread here in the parent would read a *copy* of the kernel state
+        // (fork duplicates the process), so it could never see guest windows.
         let pid = libc::fork();
         if pid < 0 {
             fail("fork failed");
@@ -204,6 +211,19 @@ fn main() {
                 eprintln!("myos: cannot install syscall trap: {e}");
                 eprintln!("myos: this needs Linux with CONFIG_SECCOMP_FILTER.");
                 libc::_exit(120);
+            }
+            // Headless interaction tests: queue scripted input before the
+            // guest runs. Only the initial guest is injected; `execve`'d
+            // children start clean because the re-exec environment does
+            // not propagate `MYOS_INJECT` (see `exec_trampoline`).
+            if let Some(script) = std::env::var_os("MYOS_INJECT") {
+                match trap::inject_file(std::path::Path::new(&script)) {
+                    Ok(n) => eprintln!("myos: injected {n} input events"),
+                    Err(e) => {
+                        eprintln!("myos: inject failed: {e}");
+                        libc::_exit(121);
+                    }
+                }
             }
             // Never returns; the guest owns the thread from here.
             loader::enter(loaded.entry, loaded.stack_top);

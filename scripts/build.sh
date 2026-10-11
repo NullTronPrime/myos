@@ -11,14 +11,21 @@ cargo build --release
 
 out=target/guest
 root=target/rootfs
-cc=${CC:-/c/msys64/ucrt64/bin/gcc.exe}
+cc=${CC:-gcc}
 
 mkdir -p "$out" "$root/bin" "$root/etc" "$root/dev" "$root/lib"
 
 # Guests that link the host's static glibc: fixed-address, no interpreter.
-for g in sh sh2 init window_server desktop_shell terminal catfile catstdin proc_parent proc_child fb_paint; do
+for g in sh sh2 init window_server desktop_shell terminal input_test catfile catstdin proc_parent proc_child fb_paint; do
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/$g" "guest/$g.c"
 done
+
+# fetch and browser are static but resolve names through guest/lib/resolve.c
+# (numeric, /etc/hosts, hand-built DNS): glibc NSS needs shared modules that
+# a static guest can neither see nor load. Both link the minimal TLS 1.2
+# client (guest/lib/tls.c) for https:// URLs.
+"$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/fetch" guest/fetch.c guest/lib/resolve.c guest/lib/tls.c
+"$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/browser" guest/browser.c guest/lib/resolve.c guest/lib/tls.c
 
 # A dynamically linked guest: exercises PT_INTERP + host ld.so inside myos.
 "$cc" -O2 -o "$out/dyn_hello" guest/dyn_hello.c
@@ -40,7 +47,7 @@ done
 # Populate the directory the guest sees as /.
 cp "$out/sh" "$out/sh2" "$out/init" "$out/window_server" "$out/desktop_shell" "$out/terminal" \
    "$out/dyn_hello" "$out/pie_guest" "$out/selfhost" \
-   "$out/catfile" "$out/catstdin" "$root/bin/"
+   "$out/catfile" "$out/catstdin" "$out/fetch" "$out/browser" "$root/bin/"
 printf 'myos: parasitic kernel, running inside a process.\n' > "$root/etc/motd"
 printf 'os-1.0\n' > "$root/etc/version"
 

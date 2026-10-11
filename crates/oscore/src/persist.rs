@@ -55,6 +55,16 @@ pub fn host_path(root: &Path, guest: &str) -> PathBuf {
     p
 }
 
+/// Whether a guest path lives in the host-owned rendezvous namespace.
+///
+/// `/winserv` is bridged live to the host rootfs by the trap layer (every
+/// guest process sees the same directory), so it must never be snapshotted
+/// into the VFS or written back: either direction would resurrect deleted
+/// registrations or clobber live ones with stale copies.
+pub fn is_shared_namespace(guest: &str) -> bool {
+    guest == "/winserv" || guest.starts_with("/winserv/")
+}
+
 /// Writes every file in `vfs` under `root`, creating directories as needed.
 ///
 /// Returns an error naming the first host write that failed; the walk stops
@@ -66,7 +76,10 @@ pub fn write_all(vfs: &Vfs, root: &Path) -> Result<SyncStats, String> {
 
     for node in vfs.nodes() {
         if node.kind.is_dir() {
-            dirs.push(vfs.path_of(node.ino));
+            let p = vfs.path_of(node.ino);
+            if !is_shared_namespace(&p) {
+                dirs.push(p);
+            }
         }
     }
     // Shallow directories first, so a file's parent always exists before the
@@ -91,7 +104,7 @@ pub fn write_all(vfs: &Vfs, root: &Path) -> Result<SyncStats, String> {
         let guest = vfs.path_of(node.ino);
         // `path_of` returns `/` when it cannot locate a file's parents, which
         // would otherwise try to write over the root directory itself.
-        if guest == "/" {
+        if guest == "/" || is_shared_namespace(&guest) {
             continue;
         }
         let data = vfs.contents(node.ino);
@@ -139,6 +152,12 @@ fn walk(
         let name = entry.file_name().to_string_lossy().into_owned();
         // Skip anything that could escape or confuse the guest's view.
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            continue;
+        }
+        // The rendezvous namespace is host-owned and bridged live; a VFS
+        // snapshot of it would go stale on arrival and be written back over
+        // live state on sync.
+        if guest.is_empty() && name == "winserv" {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
@@ -301,6 +320,34 @@ mod tests {
         assert_eq!(stats.files, 1);
         assert_eq!(stats.bytes, 0);
         assert_eq!(std::fs::metadata(host.join("tmp/blank")).unwrap().len(), 0);
+        std::fs::remove_dir_all(&host).unwrap();
+    }
+
+    #[test]
+    fn winserv_never_crosses_the_vfs_boundary() {
+        // A stale VFS copy must neither be written back (resurrecting a
+        // deletion) nor preloaded (shadowing live state).
+        let host = tmpdir("winserv");
+        let mut vfs = Vfs::new();
+        vfs.mkdir("/winserv").unwrap();
+        vfs.mkdir("/winserv/clients").unwrap();
+        vfs.create("/winserv/clients/9", b"1 x\n").unwrap();
+        vfs.mkdir("/home").unwrap();
+        vfs.create("/home/note", b"hi").unwrap();
+        let stats = write_all(&vfs, &host).unwrap();
+        assert_eq!(stats.files, 1);
+        assert!(!host.join("winserv").exists());
+        assert_eq!(std::fs::read(host.join("home/note")).unwrap(), b"hi");
+
+        std::fs::create_dir_all(host.join("winserv/clients")).unwrap();
+        std::fs::write(host.join("winserv/clients/7"), b"2 y\n").unwrap();
+        let mut next = Vfs::new();
+        read_all(&host, &mut next).unwrap();
+        assert!(next.lookup("/winserv/clients/7").is_err());
+        assert_eq!(
+            next.contents(next.lookup("/home/note").unwrap()),
+            b"hi"
+        );
         std::fs::remove_dir_all(&host).unwrap();
     }
 

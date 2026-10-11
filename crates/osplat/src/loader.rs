@@ -154,11 +154,21 @@ pub fn prepare(
 
     // Resolve DT_NEEDED dependencies: load shared libraries the guest needs.
     // This is what lets a dynamically linked guest use our libc.so instead of
-    // the host's glibc.
+    // the host's glibc. A name that is not in the rootfs is left to the
+    // guest's own interpreter: it runs at a high address, so its `openat`
+    // and `mmap` reach the host filesystem straight past the filter and it
+    // loads host libraries (NSS, DNS, TLS) normally. Failing closed here
+    // would make every host-libc dynamic guest unstartable.
     let root = root.map(|p| p.to_path_buf());
     let needed = parse_dt_needed(image, bytes);
     for lib in &needed {
-        load_shared_lib(lib, root.as_deref())?;
+        match try_load_shared_lib(lib, root.as_deref()) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("myos: leaving {lib} to the guest dynamic linker");
+            }
+            Err(e) => return Err(e),
+        }
     }
     // Two distinct addresses, and conflating them is why a dynamic guest dies.
     // We jump to the interpreter's entry point, but `AT_ENTRY` names the
@@ -248,14 +258,22 @@ fn load_interpreter(image: &ElfImage, bytes: &[u8]) -> Result<Option<Interpreter
 /// linker), and its `R_X86_64_RELATIVE` entries are applied. Symbol resolution
 /// against the main executable is not yet supported: only self-contained
 /// libraries with no undefined symbols can be loaded.
-fn load_shared_lib(name: &str, root: Option<&Path>) -> Result<(u64, u64), String> {
+///
+/// Returns `Ok(true)` when the library was mapped, `Ok(false)` when it is not
+/// in the rootfs and is left to the guest's interpreter (see `prepare`).
+/// Anything malformed is still a hard error: silently running against the
+/// wrong bytes would be worse than refusing to run.
+fn try_load_shared_lib(name: &str, root: Option<&Path>) -> Result<bool, String> {
     // Find the library in the rootfs
     let path = match root {
         Some(r) => r.join("lib").join(name),
         None => PathBuf::from(name),
     };
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("cannot read shared library {name}: {e}"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot read shared library {name}: {e}")),
+    };
     let image = ElfImage::parse(&bytes)
         .map_err(|e| format!("shared library {name} is not a valid ELF: {}", e.as_str()))?;
     if image.header.etype != Type::SharedObject {
@@ -278,7 +296,8 @@ fn load_shared_lib(name: &str, root: Option<&Path>) -> Result<(u64, u64), String
         }
     }
 
-    Ok((base, base + image.image_span().map(|(_, hi)| hi).unwrap_or(0)))
+    let _span = base + image.image_span().map(|(_, hi)| hi).unwrap_or(0);
+    Ok(true)
 }
 
 /// Applies a static PIE's base-relative relocations.
