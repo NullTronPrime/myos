@@ -1,6 +1,6 @@
-// A tiny interactive shell, run as a myos guest.
+// A tiny interactive shell, run as a parasyteos guest.
 //
-// Reads a command line from stdin, forks, execs the program through the myos
+// Reads a command line from stdin, forks, execs the program through the parasyteos
 // `execve` trampoline, and waits for it. A line may chain commands with `|`,
 // which the host-backed pipe/fork/dup2 support makes real. Reading is done one
 // byte at a time so the shell never buffers input meant for a child sharing

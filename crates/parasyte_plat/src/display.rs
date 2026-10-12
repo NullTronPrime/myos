@@ -10,7 +10,7 @@
 //! its in-memory framebuffer. A window server is an output device, not a
 //! requirement for booting.
 
-use oscore::input::{Button, Event, EventKind, Mods};
+use parasyte_core::input::{Button, Event, EventKind, Mods};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
@@ -194,7 +194,7 @@ pub fn compositor_loop() {
                     Ok(g) => {
                         let fb = g.display.composite(|win| {
                             if win.buffer == 0 {
-                                return Err(oscore::vfs::Errno::Inval);
+                                return Err(parasyte_core::vfs::Errno::Inval);
                             }
                             let buf = unsafe {
                                 std::slice::from_raw_parts(
@@ -254,7 +254,7 @@ pub fn present(frame: &[u8]) {
             static RESIZE_WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !RESIZE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("myos: display resize to {}x{} refused", w, h);
+                eprintln!("parasyteos: display resize to {}x{} refused", w, h);
             }
             return;
         }
@@ -262,7 +262,7 @@ pub fn present(frame: &[u8]) {
     // A failure here means the server is gone. Dropping the connection lets the
     // guest keep running headless rather than writing into a dead socket.
     if d.put_image(&pixels, w, h).is_none() {
-        eprintln!("myos: DBG display put_image failed, dropping connection");
+        eprintln!("parasyteos: DBG display put_image failed, dropping connection");
         *guard = None;
         return;
     }
@@ -270,7 +270,7 @@ pub fn present(frame: &[u8]) {
     // rather than a reply. Reading without waiting costs nothing and turns "the
     // screen is blank for no visible reason" into a message that says why.
     if d.read_packets(false).is_err() {
-        eprintln!("myos: DBG display read failed after present, dropping connection");
+        eprintln!("parasyteos: DBG display read failed after present, dropping connection");
         *guard = None;
     }
 }
@@ -330,7 +330,7 @@ impl Display {
         let path = socket_path()?;
         let mut stream = UnixStream::connect(&path).ok()?;
         // Close-on-exec: forked-then-exec'd children inherit every fd, and
-        // every myos process pumps its own X socket before each syscall. A
+        // every parasyteos process pumps its own X socket before each syscall. A
         // shared socket means N readers splitting one packet stream, which
         // desynchronises ALL of them (dead input, vanishing windows). The
         // creating process must be the only reader, so children never
@@ -358,7 +358,7 @@ impl Display {
             let mut reason = vec![0u8; reason_len];
             stream.read_exact(&mut reason).ok()?;
             eprintln!(
-                "myos: X11 setup refused: {}",
+                "parasyteos: X11 setup refused: {}",
                 String::from_utf8_lossy(&reason)
             );
             return None;
@@ -427,7 +427,7 @@ impl Display {
             d.settle();
             if !d.bad_value {
                 if i != 0 {
-                    eprintln!("myos: display events limited to {label}");
+                    eprintln!("parasyteos: display events limited to {label}");
                 }
                 chosen = Some(*mask);
                 break;
@@ -461,7 +461,7 @@ impl Display {
         d.probing = false;
         d.pixels = drawn && !d.bad_gc;
         if !d.pixels {
-            eprintln!("myos: display cannot show pixels: the server refused PutImage");
+            eprintln!("parasyteos: display cannot show pixels: the server refused PutImage");
         }
         Some(d)
     }
@@ -517,7 +517,7 @@ impl Display {
 
     /// Sets `WM_NAME` so the window is identifiable in a task list.
     fn set_title(&mut self, id: u32) -> Option<()> {
-        let title = b"myos";
+        let title = b"parasyteos";
         // opcode, mode, length(2), window, property, type, format, unused(3),
         // data length, data, then padding to a word boundary.
         let mut req = Vec::with_capacity(28 + title.len());
@@ -787,19 +787,19 @@ fn display_size() -> (u32, u32) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(dflt)
     };
-    (env("MYOS_WIDTH", 640), env("MYOS_HEIGHT", 480))
+    (env("PARASYTEOS_WIDTH", 640), env("PARASYTEOS_HEIGHT", 480))
 }
 
 /// An X window to parent this client's window to, for embedded mode.
 ///
-/// `MYOS_EMBED_PARENT` names the desktop's outer window (decimal or 0x
+/// `PARASYTEOS_EMBED_PARENT` names the desktop's outer window (decimal or 0x
 /// hex). The child window then lives INSIDE the desktop's top-level
 /// window instead of opening a second one: one OS window on the host,
 /// with the desktop compositor and the app side by side in it. Input
 /// keeps flowing over the child's own connection, so no other code
 /// changes.
 fn embed_parent() -> Option<u32> {
-    let s = std::env::var("MYOS_EMBED_PARENT").ok()?;
+    let s = std::env::var("PARASYTEOS_EMBED_PARENT").ok()?;
     let s = s.trim();
     let v = if let Some(h) = s.strip_prefix("0x") {
         u32::from_str_radix(h, 16).ok()?
@@ -957,7 +957,7 @@ pub fn poll_events() -> Vec<Event> {
     let raw = match d.read_packets(false) {
         Ok(r) => r,
         Err(()) => {
-            eprintln!("myos: DBG display read failed in poll, dropping connection");
+            eprintln!("parasyteos: DBG display read failed in poll, dropping connection");
             *guard = None;
             return Vec::new();
         }
@@ -999,7 +999,7 @@ impl Display {
                 let minor = u16::from_le_bytes([pkt[8], pkt[9]]);
                 if !self.probing {
                     eprintln!(
-                        "myos: X11 error {} ({}) for request {}.{} sequence {seq}",
+                        "parasyteos: X11 error {} ({}) for request {}.{} sequence {seq}",
                         error_name(code),
                         code,
                         major,

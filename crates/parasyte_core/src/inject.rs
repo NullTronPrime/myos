@@ -1,10 +1,10 @@
 //! Headless input injection: scripted events without a display server.
 //!
-//! Live input arrives from X11 in `osplat::display`; under `cargo test` or
+//! Live input arrives from X11 in `parasyte_plat::display`; under `cargo test` or
 //! in CI there is no server at all. This module parses a small line-based
 //! script into [`crate::input::Event`]s so interaction (clicks, drags,
 //! Alt-Tab, typing) can be driven deterministically. The trap layer feeds
-//! `MYOS_INJECT` through this parser before entering the guest.
+//! `PARASYTEOS_INJECT` through this parser before entering the guest.
 //!
 //! Script lines (blank lines and `#` comments ignored):
 //!
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Coordinates and window ids are decimal integers. Keysyms mirror what the
-//! live X11 path produces (`osplat::display::keysym`), including its
+//! live X11 path produces (`parasyte_plat::display::keysym`), including its
 //! Up/Down and Left/Right aliases, so a script replays what a real server
 //! would have sent.
 

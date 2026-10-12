@@ -18,7 +18,7 @@
 //!    seccomp's process-wide scope would force the handler's own syscalls to be
 //!    allow-listed, and those allowances would leak to the guest.
 //! 3. The `SIGSYS` handler reads the syscall number and arguments out of
-//!    `ucontext_t`, runs the pure dispatcher from `oscore`, and writes the
+//!    `ucontext_t`, runs the pure dispatcher from `parasyte_core`, and writes the
 //!    result back into `rax`. The kernel has already stepped `rip` past the
 //!    `syscall` instruction, so only `rax` needs adjusting.
 //!
@@ -32,7 +32,7 @@
 
 use crate::regs;
 use libc::{c_char, c_int, c_void, sigaction, siginfo_t, ucontext_t};
-use oscore::syscall::{
+use parasyte_core::syscall::{
     dispatch, FdKind, FdTable, GuestMemory, GuestState, Registers, MAP_ANONYMOUS, MAP_FIXED,
     PROT_READ, PROT_WRITE, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_CONNECT,
     SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETDENTS,
@@ -42,7 +42,7 @@ use oscore::syscall::{
     SYS_SETSID, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SYNC_FS,
     SYS_UNLINK, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE,
 };
-use oscore::vfs::{Fd, Vfs};
+use parasyte_core::vfs::{Fd, Vfs};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -179,18 +179,18 @@ pub struct TrapState {
     /// host's own base, so a guest that never calls `arch_prctl` is unaffected.
     pub guest_fs: u64,
     /// The guest's display and window model.
-    pub display: oscore::gfx::Display,
+    pub display: parasyte_core::gfx::Display,
     /// PPM bytes produced by the last `display_present`, drained by the handler.
     pub frame: Vec<u8>,
     /// Wall and monotonic time, refreshed from the host before every trap so a
     /// guest's clock moves even when it makes no syscalls of its own.
-    pub clock: oscore::clock::Clock,
+    pub clock: parasyte_core::clock::Clock,
     /// Whether `clock` has been seeded with a host reading yet.
     pub clock_started: bool,
     /// Signal dispositions, blocked mask and pending queue.
-    pub signals: oscore::signal::SignalTable,
+    pub signals: parasyte_core::signal::SignalTable,
     /// Keyboard and mouse events waiting for the guest.
-    pub input: oscore::input::InputQueue,
+    pub input: parasyte_core::input::InputQueue,
     /// The guest's working directory, used to resolve relative paths.
     pub cwd: String,
     /// The guest's file mode creation mask.
@@ -203,11 +203,11 @@ pub struct TrapState {
     /// guest that asks on every frame does not leak one per frame.
     pub input_fd: Option<u32>,
     /// Epoll instances, keyed by guest fd.
-    pub epolls: std::collections::BTreeMap<u32, oscore::syscall::EpollInstance>,
+    pub epolls: std::collections::BTreeMap<u32, parasyte_core::syscall::EpollInstance>,
     /// Eventfds, keyed by guest fd.
-    pub eventfds: std::collections::BTreeMap<u32, oscore::syscall::EventFd>,
+    pub eventfds: std::collections::BTreeMap<u32, parasyte_core::syscall::EventFd>,
     /// Futex table.
-    pub futexes: std::collections::BTreeMap<u64, oscore::syscall::Futex>,
+    pub futexes: std::collections::BTreeMap<u64, parasyte_core::syscall::Futex>,
     /// Platform-provided poll function for host-backed fds.
     pub poll_host: Option<fn(i32, i16) -> i16>,
     /// Platform-provided pty: open a pseudo-terminal master.
@@ -251,12 +251,12 @@ impl TrapState {
             mapped_brk: 0,
             pid: 0,
             guest_fs: 0,
-            display: oscore::gfx::Display::new(display_width(), display_height()),
+            display: parasyte_core::gfx::Display::new(display_width(), display_height()),
             frame: Vec::new(),
-            clock: oscore::clock::Clock::default(),
+            clock: parasyte_core::clock::Clock::default(),
             clock_started: false,
-            signals: oscore::signal::SignalTable::new(),
-            input: oscore::input::InputQueue::new(),
+            signals: parasyte_core::signal::SignalTable::new(),
+            input: parasyte_core::input::InputQueue::new(),
             cwd: "/".to_string(),
             umask: 0o022,
             frame_counter: 0,
@@ -504,13 +504,13 @@ fn rewind(uc: &mut libc::ucontext_t) {
 /// Called when the guest asks for a `sync` and again before the process exits,
 /// so a guest that never syncs explicitly still finds its files on disk next
 /// time.
-pub fn sync_filesystem() -> Option<oscore::persist::SyncStats> {
+pub fn sync_filesystem() -> Option<parasyte_core::persist::SyncStats> {
     let root = ROOT.get()?;
     let g = state().lock().unwrap_or_else(|p| p.into_inner());
-    match oscore::persist::write_all(&g.vfs, root) {
+    match parasyte_core::persist::write_all(&g.vfs, root) {
         Ok(stats) => Some(stats),
         Err(e) => {
-            eprintln!("myos: filesystem sync failed: {e}");
+            eprintln!("parasyteos: filesystem sync failed: {e}");
             None
         }
     }
@@ -525,23 +525,23 @@ static KERNEL_FS: AtomicU64 = AtomicU64::new(0);
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Host file the last composited frame is written to as a PPM, when configured
-/// through `MYOS_FB_OUT`.
+/// through `PARASYTEOS_FB_OUT`.
 static FB_OUT: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-/// Display width, from `MYOS_DISPLAY` (`WxH`) or the model's default.
+/// Display width, from `PARASYTEOS_DISPLAY` (`WxH`) or the model's default.
 fn display_width() -> u32 {
     parse_display().0
 }
 
-/// Display height, from `MYOS_DISPLAY` (`WxH`) or the model's default.
+/// Display height, from `PARASYTEOS_DISPLAY` (`WxH`) or the model's default.
 fn display_height() -> u32 {
     parse_display().1
 }
 
-/// Parses `MYOS_DISPLAY`, falling back to the model defaults.
+/// Parses `PARASYTEOS_DISPLAY`, falling back to the model defaults.
 fn parse_display() -> (u32, u32) {
-    let (mut w, mut h) = (oscore::gfx::DEFAULT_WIDTH, oscore::gfx::DEFAULT_HEIGHT);
-    if let Ok(spec) = std::env::var("MYOS_DISPLAY") {
+    let (mut w, mut h) = (parasyte_core::gfx::DEFAULT_WIDTH, parasyte_core::gfx::DEFAULT_HEIGHT);
+    if let Ok(spec) = std::env::var("PARASYTEOS_DISPLAY") {
         let mut it = spec.split(['x', 'X', ',']);
         if let (Some(a), Some(b)) = (it.next(), it.next()) {
             if let (Ok(pw), Ok(ph)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
@@ -608,8 +608,8 @@ fn write_i64(buf: &mut [u8], mut v: i64) -> usize {
     n
 }
 
-/// Logs one trapped syscall to stderr when `MYOS_TRACE=1` is set.
-fn trace(nr: i64, arg0: u64, ip: u64, ret: Result<u64, oscore::vfs::Errno>) {
+/// Logs one trapped syscall to stderr when `PARASYTEOS_TRACE=1` is set.
+fn trace(nr: i64, arg0: u64, ip: u64, ret: Result<u64, parasyte_core::vfs::Errno>) {
     if !TRACE.load(Ordering::Relaxed) {
         return;
     }
@@ -717,7 +717,7 @@ extern "C" fn fault_handler(sig: c_int, info: *mut siginfo_t, uc: *mut c_void) {
         // that fits the worst case is simpler than a bounds-checked writer.
         let mut buf = [0u8; 512];
         let mut n = 0;
-        for &b in b"myos: fault sig=" {
+        for &b in b"parasyteos: fault sig=" {
             buf[n] = b;
             n += 1;
         }
@@ -979,7 +979,7 @@ fn install_handler() -> Result<(), String> {
             libc::sigaction(s, &fa, std::ptr::null_mut());
         }
     }
-    TRACE.store(std::env::var_os("MYOS_TRACE").is_some(), Ordering::SeqCst);
+    TRACE.store(std::env::var_os("PARASYTEOS_TRACE").is_some(), Ordering::SeqCst);
     Ok(())
 }
 
@@ -1024,21 +1024,21 @@ pub fn is_installed() -> bool {
 pub struct HostMemory;
 
 impl GuestMemory for HostMemory {
-    fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, oscore::vfs::Errno> {
+    fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, parasyte_core::vfs::Errno> {
         if addr == 0 || len == 0 {
-            return Err(oscore::vfs::Errno::Inval);
+            return Err(parasyte_core::vfs::Errno::Inval);
         }
-        unsafe { regs::read_guest(addr, len) }.ok_or(oscore::vfs::Errno::Inval)
+        unsafe { regs::read_guest(addr, len) }.ok_or(parasyte_core::vfs::Errno::Inval)
     }
 
-    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), oscore::vfs::Errno> {
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), parasyte_core::vfs::Errno> {
         if addr == 0 {
-            return Err(oscore::vfs::Errno::Inval);
+            return Err(parasyte_core::vfs::Errno::Inval);
         }
         if unsafe { regs::write_guest(addr, data) } {
             Ok(())
         } else {
-            Err(oscore::vfs::Errno::Inval)
+            Err(parasyte_core::vfs::Errno::Inval)
         }
     }
 
@@ -1048,13 +1048,13 @@ impl GuestMemory for HostMemory {
         len: u64,
         prot: u32,
         flags: u32,
-    ) -> Result<u64, oscore::vfs::Errno> {
-        use oscore::syscall::{MAP_ANONYMOUS, MAP_FIXED};
-        use oscore::vfs::Errno;
+    ) -> Result<u64, parasyte_core::vfs::Errno> {
+        use parasyte_core::syscall::{MAP_ANONYMOUS, MAP_FIXED};
+        use parasyte_core::vfs::Errno;
         if len == 0 {
             return Err(Errno::Inval);
         }
-        let size = oscore::addr::align_up(len).ok_or(Errno::Inval)? as usize;
+        let size = parasyte_core::addr::align_up(len).ok_or(Errno::Inval)? as usize;
 
         // Guest and kernel share one address space, so a guest `mmap` becomes a
         // real `mmap` of this process. That is what makes the guest's memory
@@ -1070,7 +1070,7 @@ impl GuestMemory for HostMemory {
                 return Err(Errno::Inval);
             }
             mflags |= libc::MAP_FIXED;
-            hint = (oscore::addr::align_down(addr)) as *mut c_void;
+            hint = (parasyte_core::addr::align_down(addr)) as *mut c_void;
         }
         let p = unsafe { libc::mmap(hint, size, prot as i32, mflags, -1, 0) };
         if p == libc::MAP_FAILED {
@@ -1079,12 +1079,12 @@ impl GuestMemory for HostMemory {
         Ok(p as u64)
     }
 
-    fn unmap(&mut self, addr: u64, len: u64) -> Result<(), oscore::vfs::Errno> {
-        use oscore::vfs::Errno;
+    fn unmap(&mut self, addr: u64, len: u64) -> Result<(), parasyte_core::vfs::Errno> {
+        use parasyte_core::vfs::Errno;
         if len == 0 {
             return Err(Errno::Inval);
         }
-        let size = oscore::addr::align_up(len).ok_or(Errno::Inval)? as usize;
+        let size = parasyte_core::addr::align_up(len).ok_or(Errno::Inval)? as usize;
         let rc = unsafe { libc::munmap(addr as *mut c_void, size) };
         if rc != 0 {
             return Err(Errno::Inval);
@@ -1092,8 +1092,8 @@ impl GuestMemory for HostMemory {
         Ok(())
     }
 
-    fn protect(&mut self, addr: u64, len: u64, prot: u32) -> Result<(), oscore::vfs::Errno> {
-        use oscore::vfs::Errno;
+    fn protect(&mut self, addr: u64, len: u64, prot: u32) -> Result<(), parasyte_core::vfs::Errno> {
+        use parasyte_core::vfs::Errno;
         if len == 0 {
             return Err(Errno::Inval);
         }
@@ -1101,7 +1101,7 @@ impl GuestMemory for HostMemory {
         // real `mprotect` of this process's pages. That is what makes the guest's
         // protections binding: once glibc marks its GOT read-only for RELRO, a
         // guest write to it faults for real rather than being silently allowed.
-        let size = oscore::addr::align_up(len).ok_or(Errno::Inval)? as usize;
+        let size = parasyte_core::addr::align_up(len).ok_or(Errno::Inval)? as usize;
         let rc = unsafe { libc::mprotect(addr as *mut c_void, size, prot as i32) };
         if rc != 0 {
             // The only failure the host reports for a guest request is a range
@@ -1111,11 +1111,11 @@ impl GuestMemory for HostMemory {
         Ok(())
     }
 
-    fn read_cstr(&self, addr: u64) -> Result<Vec<u8>, oscore::vfs::Errno> {
+    fn read_cstr(&self, addr: u64) -> Result<Vec<u8>, parasyte_core::vfs::Errno> {
         if addr == 0 {
-            return Err(oscore::vfs::Errno::Inval);
+            return Err(parasyte_core::vfs::Errno::Inval);
         }
-        unsafe { regs::read_cstr_guest(addr, 4096) }.ok_or(oscore::vfs::Errno::NameTooLong)
+        unsafe { regs::read_cstr_guest(addr, 4096) }.ok_or(parasyte_core::vfs::Errno::NameTooLong)
     }
 }
 
@@ -1161,7 +1161,7 @@ pub fn shm_unlink(name: &str) {
 /// - `/dev/audio` (write-only: raw unsigned 8-bit mono PCM at 8000 Hz.
 ///   Writes stream to the host's `paplay` (PulseAudio); the format is
 ///   intentionally fixed — this is an 8-bit minimalist sound card, not a
-///   mixer. Reads are rejected. Set `MYOS_AUDIO_CMD` to redirect playback,
+///   mixer. Reads are rejected. Set `PARASYTEOS_AUDIO_CMD` to redirect playback,
 ///   e.g. `tee /tmp/cap.u8`, for testing without speakers);
 /// - `/winserv` and everything under it (the window-server rendezvous:
 ///   client registrations and the server pid file). This is the one
@@ -1177,13 +1177,13 @@ pub fn shm_unlink(name: &str) {
 /// sound-card backpressure. Closing the fd sends EOF and the player exits;
 /// a detached thread reaps it so no zombie lingers.
 ///
-/// `MYOS_AUDIO_CMD` overrides the player (whitespace-split, no quoting):
-/// `MYOS_AUDIO_CMD="tee /tmp/cap.u8"` captures guest audio to a file for
+/// `PARASYTEOS_AUDIO_CMD` overrides the player (whitespace-split, no quoting):
+/// `PARASYTEOS_AUDIO_CMD="tee /tmp/cap.u8"` captures guest audio to a file for
 /// testing on a headless box.
 fn audio_open() -> Result<i32, i32> {
     use std::os::unix::io::IntoRawFd;
     use std::process::{Command, Stdio};
-    let cmdline = std::env::var("MYOS_AUDIO_CMD").unwrap_or_else(|_| {
+    let cmdline = std::env::var("PARASYTEOS_AUDIO_CMD").unwrap_or_else(|_| {
         "paplay --raw --rate=8000 --channels=1 --format=u8".to_string()
     });
     let mut words = cmdline.split_whitespace();
@@ -1502,15 +1502,15 @@ unsafe fn read_guest_argv(mut ptr: u64) -> Result<Vec<Vec<u8>>, i64> {
 
 /// Queues scripted input events for the guest under test.
 ///
-/// Reads an `oscore::inject` script from `path` and appends every event to
+/// Reads an `parasyte_core::inject` script from `path` and appends every event to
 /// the guest input queue. Used for headless interaction tests
-/// (`MYOS_INJECT`); with no display server these are the only events the
+/// (`PARASYTEOS_INJECT`); with no display server these are the only events the
 /// guest will ever see. Returns the event count.
 pub fn inject_file(path: &Path) -> Result<usize, String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let events =
-        oscore::inject::parse_script(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        parasyte_core::inject::parse_script(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let n = events.len();
     let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
     for e in events {
@@ -1554,11 +1554,11 @@ fn resolve_path(guest: &[u8]) -> Vec<u8> {
     p.to_string_lossy().into_owned().into_bytes()
 }
 
-/// Replaces the current guest with a fresh `myos` that loads `path`.
+/// Replaces the current guest with a fresh `parasyteos` that loads `path`.
 ///
 /// `guest` is the path as the guest named it (kept as `argv[0]`); `host` is
 /// where that path resolves on the host. The caller is already a forked guest,
-/// so `myos --exec` loads the new image in place instead of forking again. A
+/// so `parasyteos --exec` loads the new image in place instead of forking again. A
 /// seccomp filter survives `execve`; the SIGSYS disposition does not, so the
 /// re-exec'd launcher re-arms the handler (and skips re-installing the filter,
 /// which is already in force).
@@ -1567,10 +1567,10 @@ fn exec_trampoline(guest: &[u8], host: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]
         CString::new(s.iter().copied().filter(|b| *b != 0).collect::<Vec<u8>>()).unwrap_or_default()
     };
 
-    // `myos --exec <argv0> <host-program> [args...]`: argv[0] and the file to
+    // `parasyteos --exec <argv0> <host-program> [args...]`: argv[0] and the file to
     // load are separate so the guest keeps seeing the name it invoked.
     let mut args_owned: Vec<CString> = Vec::new();
-    args_owned.push(CString::new("myos").unwrap());
+    args_owned.push(CString::new("parasyteos").unwrap());
     args_owned.push(CString::new("--exec").unwrap());
     args_owned.push(to_c(if argv.is_empty() { guest } else { &argv[0] }));
     args_owned.push(to_c(host));
@@ -1584,14 +1584,14 @@ fn exec_trampoline(guest: &[u8], host: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]
     // The re-exec'd launcher rebuilds the same rootfs and display from its
     // environment.
     if let Some(root) = root() {
-        if let Ok(e) = CString::new(format!("MYOS_ROOT={}", root.display())) {
+        if let Ok(e) = CString::new(format!("PARASYTEOS_ROOT={}", root.display())) {
             env_owned.push(e);
         }
     }
     // DISPLAY too: without it the child cannot find the X socket and
     // every GUI app launched from the desktop runs headless (its window
     // never reaches the compositor).
-    for key in ["DISPLAY", "MYOS_DISPLAY", "MYOS_FB_OUT"] {
+    for key in ["DISPLAY", "PARASYTEOS_DISPLAY", "PARASYTEOS_FB_OUT"] {
         if let Ok(v) = std::env::var(key) {
             if let Ok(e) = CString::new(format!("{key}={v}")) {
                 env_owned.push(e);
@@ -1789,7 +1789,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             if !restored {
                 // A handler that cannot return has left nothing sensible to
                 // resume, so the guest ends here rather than running on.
-                eprintln!("myos: rt_sigreturn could not restore the signal frame");
+                eprintln!("parasyteos: rt_sigreturn could not restore the signal frame");
                 unsafe { libc::_exit(139) };
             }
             true
@@ -1810,9 +1810,9 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
                 return true;
             }
             let mut st = state().lock().unwrap_or_else(|p| p.into_inner());
-            st.signals.queue(oscore::signal::Pending::kernel(
+            st.signals.queue(parasyte_core::signal::Pending::kernel(
                 signum,
-                oscore::signal::SI_USER,
+                parasyte_core::signal::SI_USER,
                 0,
             ));
             drop(st);
@@ -1843,7 +1843,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             // An embedded client drags its outer host window with this
             // call; the dispatcher below still updates the guest-side
             // model, so this arm never claims the syscall.
-            if std::env::var_os("MYOS_EMBED_PARENT").is_some() {
+            if std::env::var_os("PARASYTEOS_EMBED_PARENT").is_some() {
                 crate::display::move_outer(regs_in.arg(1) as i32, regs_in.arg(2) as i32);
             }
             false
@@ -1851,7 +1851,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
         SYS_WINDOW_RESIZE => {
             // Same for resizes: the outer host window follows, the guest
             // model updates in the dispatcher below.
-            if std::env::var_os("MYOS_EMBED_PARENT").is_some() {
+            if std::env::var_os("PARASYTEOS_EMBED_PARENT").is_some() {
                 crate::display::resize_outer(regs_in.arg(1) as u32, regs_in.arg(2) as u32);
             }
             false
@@ -2011,7 +2011,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
         SYS_FSTAT => {
             // Host-backed descriptors (pipes, sockets, bridged files and
             // directories) stat through the host. The bytes follow the same
-            // 144-byte layout `oscore::vfs::Stat::to_bytes` produces, so a
+            // 144-byte layout `parasyte_core::vfs::Stat::to_bytes` produces, so a
             // guest cannot tell which side of the trap its file lives on.
             // (That layout omits `st_rdev`; both writers agree, which is
             // what matters here.)
@@ -2626,7 +2626,7 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             match (path, argv, envp) {
                 (Some(path), Ok(argv), Ok(envp)) => {
                     // Resolve through the rootfs, then report a missing target
-                    // here: it is loaded by a fresh `myos`, so otherwise the
+                    // here: it is loaded by a fresh `parasyteos`, so otherwise the
                     // failure would surface as that launcher's exit rather than
                     // an `execve` errno.
                     let host = resolve_path(&path);
@@ -2714,7 +2714,7 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         // The clock is refreshed before the syscall runs, not after, so a guest
         // that reads the time and then sleeps sees the deadline it just read.
         if !st.clock_started {
-            st.clock = oscore::clock::Clock::new(
+            st.clock = parasyte_core::clock::Clock::new(
                 host_clock_ns(libc::CLOCK_REALTIME),
                 host_clock_ns(libc::CLOCK_MONOTONIC),
             );
@@ -2835,8 +2835,8 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         // already there (glibc's TLS block, for one).
         if regs_in.nr == SYS_BRK {
             if let (Some(old), Some(new)) = (
-                oscore::addr::align_up(*mapped_brk),
-                oscore::addr::align_up(gs.brk),
+                parasyte_core::addr::align_up(*mapped_brk),
+                parasyte_core::addr::align_up(gs.brk),
             ) {
                 if new > old {
                     let _ = mem.map(
@@ -2915,14 +2915,14 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         unsafe { libc::write(1, out.as_ptr() as *const c_void, out.len()) };
     }
 
-    // A composited frame is written out only when `MYOS_FB_OUT` names a file,
+    // A composited frame is written out only when `PARASYTEOS_FB_OUT` names a file,
     // which is what makes the display observable without a real window.
     if !present.is_empty() {
         if let Some(path) =
-            FB_OUT.get_or_init(|| std::env::var_os("MYOS_FB_OUT").map(PathBuf::from))
+            FB_OUT.get_or_init(|| std::env::var_os("PARASYTEOS_FB_OUT").map(PathBuf::from))
         {
             if let Err(e) = std::fs::write(path, &present) {
-                eprintln!("myos: framebuffer -> {}: {e}", path.display());
+                eprintln!("parasyteos: framebuffer -> {}: {e}", path.display());
             }
         } else {
             // With no file configured, push the frame to the real window.
@@ -2935,7 +2935,7 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         if let Some(stats) = sync_filesystem() {
             if TRACE.load(Ordering::Relaxed) {
                 eprintln!(
-                    "myos: sync {} files, {} dirs, {} bytes",
+                    "parasyteos: sync {} files, {} dirs, {} bytes",
                     stats.files, stats.dirs, stats.bytes
                 );
             }
@@ -3047,12 +3047,12 @@ pub fn with_fds<R>(f: impl FnOnce(&mut FdTable) -> R) -> R {
 }
 
 /// Registers a file in the guest's filesystem so it can be opened by path.
-pub fn provide_file(path: &str, data: &[u8]) -> Result<(), oscore::vfs::Errno> {
+pub fn provide_file(path: &str, data: &[u8]) -> Result<(), parasyte_core::vfs::Errno> {
     with_vfs(|vfs| vfs.create(path, data)).map(|_ino| ())
 }
 
 /// Registers a directory in the guest's filesystem.
-pub fn provide_dir(path: &str) -> Result<(), oscore::vfs::Errno> {
+pub fn provide_dir(path: &str) -> Result<(), parasyte_core::vfs::Errno> {
     with_vfs(|vfs| vfs.mkdir(path)).map(|_ino| ())
 }
 
@@ -3064,7 +3064,7 @@ pub fn provide_dir(path: &str) -> Result<(), oscore::vfs::Errno> {
 /// still letting a guest change its own tree.
 pub fn preload_root(root: &Path) -> Result<usize, String> {
     let mut g = state().lock().unwrap_or_else(|p| p.into_inner());
-    oscore::persist::read_all(root, &mut g.vfs)
+    parasyte_core::persist::read_all(root, &mut g.vfs)
 }
 
 /// Sets the guest's initial program break, normally the page-aligned end of the

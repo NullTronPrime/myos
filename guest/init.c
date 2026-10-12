@@ -1,4 +1,4 @@
-/* init: the first process a myos guest runs.
+/* init: the first process a parasyteos guest runs.
  *
  * Sets up the environment, starts the shell, and reaps orphaned children.
  * This is the guest's PID 1 equivalent.
@@ -14,8 +14,8 @@ int main(void) {
     // Set up default environment
     setenv("PATH", "/bin:/usr/bin:/usr/local/bin", 1);
     setenv("HOME", "/", 1);
-    setenv("TERM", "myos", 1);
-    setenv("MYOS", "1", 1);
+    setenv("TERM", "parasyteos", 1);
+    setenv("PARASYTEOS", "1", 1);
 
     // Open console
     int fd = open("/dev/console", O_RDWR);
@@ -27,8 +27,8 @@ int main(void) {
     }
 
     printf("\n");
-    printf("myos: init starting\n");
-    printf("myos: welcome to the parasitic OS\n");
+    printf("parasyteos: init starting\n");
+    printf("parasyteos: welcome to the parasitic OS\n");
     printf("\n");
 
     // Start the shell
@@ -39,8 +39,8 @@ int main(void) {
         char *envp[] = {
             "PATH=/bin:/usr/bin:/usr/local/bin",
             "HOME=/",
-            "TERM=myos",
-            "MYOS=1",
+            "TERM=parasyteos",
+            "PARASYTEOS=1",
             NULL
         };
         execve("/bin/sh2", argv, envp);
@@ -59,12 +59,12 @@ int main(void) {
             break;
         }
         if (WIFEXITED(status)) {
-            printf("myos: process %d exited with status %d\n", result, WEXITSTATUS(status));
+            printf("parasyteos: process %d exited with status %d\n", result, WEXITSTATUS(status));
         } else if (WIFSIGNALED(status)) {
-            printf("myos: process %d killed by signal %d\n", result, WTERMSIG(status));
+            printf("parasyteos: process %d killed by signal %d\n", result, WTERMSIG(status));
         }
     }
 
-    printf("myos: init exiting\n");
+    printf("parasyteos: init exiting\n");
     return 0;
 }

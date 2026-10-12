@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/oscore", "crates/osplat", "crates/myos"]
+members = ["crates/parasyte_core", "crates/parasyte_plat", "crates/parasyteos"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,8 +8,8 @@ edition = "2021"
 rust-version = "1.75"
 
 [workspace.dependencies]
-oscore = { path = "crates/oscore" }
-osplat = { path = "crates/osplat" }
+parasyte_core = { path = "crates/parasyte_core" }
+parasyte_plat = { path = "crates/parasyte_plat" }
 
 [profile.release]
 panic = "abort"

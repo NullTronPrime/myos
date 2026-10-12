@@ -1,12 +1,12 @@
 #!/bin/bash
-# Convert any audio ffmpeg reads into the one format myos plays: unsigned
+# Convert any audio ffmpeg reads into the one format parasyteos plays: unsigned
 # 8-bit mono PCM at 8000 Hz (the whole of the OS sound card).
 #
 #   scripts/snd.sh song.mp3 song.u8
 #   cat song.u8 > /dev/audio        # inside the OS (terminal, shell, beep)
 #
 # Playback is `paplay` over the host PulseAudio server; see
-# MYOS_AUDIO_CMD in crates/osplat/src/trap.rs to redirect it.
+# PARASYTEOS_AUDIO_CMD in crates/parasyte_plat/src/trap.rs to redirect it.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then

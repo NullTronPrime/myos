@@ -1,9 +1,9 @@
 //! Visual test: exercises all Phase 1 graphics features and outputs a PPM.
 //!
-//! Run: cargo run -p oscore --example visual_test
+//! Run: cargo run -p parasyte_core --example visual_test
 //! Output: target/visual_test.ppm
 
-use oscore::gfx::*;
+use parasyte_core::gfx::*;
 
 fn main() {
     let mut fb = Framebuffer::new(128, 96);

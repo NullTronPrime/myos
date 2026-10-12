@@ -70,12 +70,12 @@ struct term_cell {
 
 #define MAX_TABS 4
 
-// Modifier bits, matching oscore::input::Mods bitmask.
+// Modifier bits, matching parasyte_core::input::Mods bitmask.
 #define MOD_SHIFT 1
 #define MOD_CTRL 2
 #define MOD_ALT 4
 
-// Keysyms the host delivers for non-text keys (see osplat::display).
+// Keysyms the host delivers for non-text keys (see parasyte_plat::display).
 #define KEY_TAB 0xff09
 #define KEY_NEXT 0xff54   /* Page Down */
 #define KEY_PRIOR 0xff55 /* Page Up */
@@ -264,7 +264,7 @@ static int spawn_tab(void) {
         struct { unsigned short rows, cols, xpixel, ypixel; } ws = { TERM_HEIGHT, TERM_WIDTH, 0, 0 };
         syscall(SYS_IOCTL_TIOCSWINSZ, slave_fd, &ws, 0, 0, 0, 0);
         char *argv[] = {"sh2", NULL};
-        char *envp[] = { "TERM=myos", "PATH=/bin:/usr/bin", NULL };
+        char *envp[] = { "TERM=parasyteos", "PATH=/bin:/usr/bin", NULL };
         execve("/bin/sh2", argv, envp);
         perror("terminal: exec");
         _exit(127);
@@ -459,7 +459,7 @@ int main(void) {
     syscall(SYS_WINDOW_SET_TITLE, term_win, "Terminal", 0, 0, 0, 0);
 
     // Announce ourselves to the window server via the well-known path
-    // (mirrors oscore::winserv::client_path). Best effort: the terminal
+    // (mirrors parasyte_core::winserv::client_path). Best effort: the terminal
     // works standalone when the server is absent.
     mkdir("/winserv", 0755);
     mkdir("/winserv/clients", 0755);

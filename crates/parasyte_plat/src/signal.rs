@@ -1,7 +1,7 @@
-//! Turning the pure [`oscore::signal`] model into a running guest handler.
+//! Turning the pure [`parasyte_core::signal`] model into a running guest handler.
 //!
 //! The signal rules — dispositions, the blocked mask, the pending queue, and
-//! the layout of the frame handed to a handler — all live in `oscore`, where
+//! the layout of the frame handed to a handler — all live in `parasyte_core`, where
 //! they can be tested without a host. This module is the part that cannot be:
 //! it reads a real `ucontext`, pushes a frame onto the guest's own stack, and
 //! rewrites that context so the guest resumes *inside* its handler.
@@ -11,11 +11,11 @@
 
 use libc::{c_int, ucontext_t};
 
-use oscore::signal::{
+use parasyte_core::signal::{
     build_frame, Delivery, FrameRegs, Pending, SigAction, SignalTable, FRAME_ALIGN, FRAME_SIZE,
     NGREG, SIG_DFL, SIG_IGN,
 };
-use oscore::syscall::SYS_RT_SIGRETURN;
+use parasyte_core::syscall::SYS_RT_SIGRETURN;
 
 /// `SIG_BLOCK`, as `rt_sigprocmask` spells it.
 const SIG_BLOCK: u64 = 0;
@@ -65,19 +65,19 @@ pub enum Delivered {
 /// absent because their default disposition is to be ignored, but a fault with
 /// no handler installed is fatal.
 const FATAL_BY_DEFAULT: &[i32] = &[
-    oscore::signal::SIGHUP,
-    oscore::signal::SIGINT,
-    oscore::signal::SIGQUIT,
-    oscore::signal::SIGILL,
-    oscore::signal::SIGTRAP,
-    oscore::signal::SIGABRT,
-    oscore::signal::SIGBUS,
-    oscore::signal::SIGFPE,
-    oscore::signal::SIGKILL,
-    oscore::signal::SIGSEGV,
-    oscore::signal::SIGPIPE,
-    oscore::signal::SIGALRM,
-    oscore::signal::SIGTERM,
+    parasyte_core::signal::SIGHUP,
+    parasyte_core::signal::SIGINT,
+    parasyte_core::signal::SIGQUIT,
+    parasyte_core::signal::SIGILL,
+    parasyte_core::signal::SIGTRAP,
+    parasyte_core::signal::SIGABRT,
+    parasyte_core::signal::SIGBUS,
+    parasyte_core::signal::SIGFPE,
+    parasyte_core::signal::SIGKILL,
+    parasyte_core::signal::SIGSEGV,
+    parasyte_core::signal::SIGPIPE,
+    parasyte_core::signal::SIGALRM,
+    parasyte_core::signal::SIGTERM,
 ];
 
 /// True when a default disposition for `signum` ends the process.
@@ -91,14 +91,14 @@ pub fn action_is_fatal(act: &SigAction, signum: i32) -> bool {
 /// handler reads to tell a bad pointer from a bad access.
 pub fn fault_pending(sig: c_int, addr: u64) -> Option<Pending> {
     let signum = match sig {
-        libc::SIGSEGV => oscore::signal::SIGSEGV,
-        libc::SIGBUS => oscore::signal::SIGBUS,
-        libc::SIGILL => oscore::signal::SIGILL,
-        libc::SIGFPE => oscore::signal::SIGFPE,
-        libc::SIGTRAP => oscore::signal::SIGTRAP,
+        libc::SIGSEGV => parasyte_core::signal::SIGSEGV,
+        libc::SIGBUS => parasyte_core::signal::SIGBUS,
+        libc::SIGILL => parasyte_core::signal::SIGILL,
+        libc::SIGFPE => parasyte_core::signal::SIGFPE,
+        libc::SIGTRAP => parasyte_core::signal::SIGTRAP,
         _ => return None,
     };
-    Some(Pending::kernel(signum, oscore::signal::SI_KERNEL, addr))
+    Some(Pending::kernel(signum, parasyte_core::signal::SI_KERNEL, addr))
 }
 
 /// Delivers the next queued signal to the guest, if one can be delivered.
@@ -131,18 +131,18 @@ pub fn deliver(table: &mut SignalTable, uc: &mut ucontext_t) -> Delivered {
         return Delivered::Undeliverable;
     }
 
-    set_greg(uc, oscore::signal::GREG_RDI, delivery.rdi);
-    set_greg(uc, oscore::signal::GREG_RSI, delivery.rsi);
-    set_greg(uc, oscore::signal::GREG_RDX, delivery.rdx);
-    set_greg(uc, oscore::signal::GREG_RAX, delivery.rax);
-    set_greg(uc, oscore::signal::GREG_RSP, delivery.rsp);
-    set_greg(uc, oscore::signal::GREG_RIP, delivery.rip);
+    set_greg(uc, parasyte_core::signal::GREG_RDI, delivery.rdi);
+    set_greg(uc, parasyte_core::signal::GREG_RSI, delivery.rsi);
+    set_greg(uc, parasyte_core::signal::GREG_RDX, delivery.rdx);
+    set_greg(uc, parasyte_core::signal::GREG_RAX, delivery.rax);
+    set_greg(uc, parasyte_core::signal::GREG_RSP, delivery.rsp);
+    set_greg(uc, parasyte_core::signal::GREG_RIP, delivery.rip);
 
     // The signal stays blocked while its own handler runs, so a second one
     // cannot nest inside it. `SA_NODEFER` asks for exactly that, and
     // `sigreturn` puts the saved mask back either way.
     if !action.no_defer() {
-        table.change_mask(SIG_BLOCK, oscore::signal::bit(sig.signum));
+        table.change_mask(SIG_BLOCK, parasyte_core::signal::bit(sig.signum));
     }
     Delivered::Went(delivery)
 }
@@ -160,7 +160,7 @@ pub fn sigreturn(uc: &mut ucontext_t, sp: u64, table: &mut SignalTable) -> bool 
         return false;
     };
     // ucontext_t sits inside the frame, and its mcontext is at a fixed offset.
-    let mc = oscore::signal::UC_OFFSET as usize + oscore::signal::UC_MCONTEXT_OFFSET as usize;
+    let mc = parasyte_core::signal::UC_OFFSET as usize + parasyte_core::signal::UC_MCONTEXT_OFFSET as usize;
     if mc + NGREG * 8 > frame.len() {
         return false;
     }
@@ -177,9 +177,9 @@ pub fn sigreturn(uc: &mut ucontext_t, sp: u64, table: &mut SignalTable) -> bool 
     // The blocked set the signal was delivered with is recorded in the frame,
     // so returning reinstates exactly that rather than whatever the handler
     // happened to leave behind.
-    table.change_mask(SIG_SETMASK, gregs[oscore::signal::GREG_OLDMASK]);
+    table.change_mask(SIG_SETMASK, gregs[parasyte_core::signal::GREG_OLDMASK]);
     for (i, value) in gregs.iter().enumerate() {
-        if i == oscore::signal::GREG_OLDMASK || i == oscore::signal::GREG_CR2 {
+        if i == parasyte_core::signal::GREG_OLDMASK || i == parasyte_core::signal::GREG_CR2 {
             continue; // frame bookkeeping, not a register to hand back
         }
         set_greg(uc, i, *value);

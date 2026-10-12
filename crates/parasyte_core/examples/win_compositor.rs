@@ -1,20 +1,20 @@
-//! Windows compositor: runs the myos compositor natively on Windows.
+//! Windows compositor: runs the parasyteos compositor natively on Windows.
 //!
 //! Creates a window, manages windows with decorations, routes mouse input,
 //! and composites at 60fps. This is the desktop shell running without Linux.
 //!
-//! Run: cargo run -p oscore --example win_compositor
+//! Run: cargo run -p parasyte_core --example win_compositor
 
 #![cfg(windows)]
 
-use oscore::gfx::*;
+use parasyte_core::gfx::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
-const CLASS_NAME: &str = "myos_compositor";
-const WINDOW_TITLE: &str = "myos desktop";
+const CLASS_NAME: &str = "parasyteos_compositor";
+const WINDOW_TITLE: &str = "parasyteos desktop";
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 

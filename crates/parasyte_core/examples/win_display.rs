@@ -1,6 +1,6 @@
 //! Windows display server: shows the compositor output in a window.
 //!
-//! Run: cargo run -p oscore --example win_display
+//! Run: cargo run -p parasyte_core --example win_display
 
 #![cfg(windows)]
 
@@ -9,8 +9,8 @@ use std::time::Duration;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-const CLASS_NAME: &str = "myos_display";
-const WINDOW_TITLE: &str = "myos desktop";
+const CLASS_NAME: &str = "parasyteos_display";
+const WINDOW_TITLE: &str = "parasyteos desktop";
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 

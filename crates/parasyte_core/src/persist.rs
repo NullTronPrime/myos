@@ -121,7 +121,7 @@ pub fn write_all(vfs: &Vfs, root: &Path) -> Result<SyncStats, String> {
 
 /// Recursively reads a host directory into `vfs`, replacing its contents.
 ///
-/// Used when `MYOS_ROOT` is set, so the guest starts from whatever the host
+/// Used when `PARASYTEOS_ROOT` is set, so the guest starts from whatever the host
 /// directory holds rather than from a hardcoded seed.
 pub fn read_all(root: &Path, vfs: &mut Vfs) -> Result<usize, String> {
     let mut count = 0usize;
@@ -215,7 +215,7 @@ mod tests {
     use crate::vfs::Ino;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("myos-persist-{tag}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("parasyteos-persist-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -227,7 +227,7 @@ mod tests {
         vfs.mkdir("/etc").unwrap();
         vfs.mkdir("/home").unwrap();
         vfs.create("/bin/sh", b"#!/bin/sh\n").unwrap();
-        vfs.create("/etc/hostname", b"myos").unwrap();
+        vfs.create("/etc/hostname", b"parasyteos").unwrap();
         vfs.create("/data", b"payload").unwrap();
         vfs
     }
@@ -266,7 +266,7 @@ mod tests {
         // `bin`, `etc` and `home`; the root already exists on the host.
         assert_eq!(stats.dirs, 3);
         assert_eq!(std::fs::read(host.join("bin/sh")).unwrap(), b"#!/bin/sh\n");
-        assert_eq!(std::fs::read(host.join("etc/hostname")).unwrap(), b"myos");
+        assert_eq!(std::fs::read(host.join("etc/hostname")).unwrap(), b"parasyteos");
         assert_eq!(std::fs::read(host.join("data")).unwrap(), b"payload");
         assert!(host.join("bin").is_dir());
         assert!(host.join("etc").is_dir());
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn read_all_skips_unreadable_roots_rather_than_failing() {
-        let vfs_result = read_all(Path::new("/nonexistent-myos-root"), &mut Vfs::new());
+        let vfs_result = read_all(Path::new("/nonexistent-parasyteos-root"), &mut Vfs::new());
         assert!(vfs_result.is_ok());
         assert_eq!(vfs_result.unwrap(), 0);
     }

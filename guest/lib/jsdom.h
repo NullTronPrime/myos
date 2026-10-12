@@ -12,8 +12,8 @@
  * input loop; it returns nonzero when a callback ran (re-render then).
  * Navigation frees the page context, which drops pending timers with it.
  */
-#ifndef MYOS_JSDOM_H
-#define MYOS_JSDOM_H
+#ifndef PARASYTEOS_JSDOM_H
+#define PARASYTEOS_JSDOM_H
 
 #include "../../third_party/quickjs/quickjs.h"
 #include "dom.h"
@@ -41,4 +41,4 @@ void jsdom_free(struct jsdom_page *pg);
 /* Current monotonic milliseconds (shared clock for timers). */
 long jsdom_now_ms(void);
 
-#endif /* MYOS_JSDOM_H */
+#endif /* PARASYTEOS_JSDOM_H */

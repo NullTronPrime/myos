@@ -1,4 +1,4 @@
-/* tls: a minimal TLS 1.2 client for myos guests (guest/lib/tls.c).
+/* tls: a minimal TLS 1.2 client for parasyteos guests (guest/lib/tls.c).
  *
  * Offers TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 first, falling back to
  * TLS_RSA_WITH_AES_128_CBC_SHA. Static-link friendly: only
@@ -11,8 +11,8 @@
  * yet). Enough to fetch real pages where the OS has connectivity; not a
  * general trust story. See the header of tls.c for the full accounting.
  */
-#ifndef MYOS_TLS_H
-#define MYOS_TLS_H
+#ifndef PARASYTEOS_TLS_H
+#define PARASYTEOS_TLS_H
 
 #include <stddef.h>
 #include <sys/types.h>
@@ -52,4 +52,4 @@ ssize_t tls_read(struct tls_ctx *t, void *buf, size_t n);
 /* Frees pending buffers (does not close fd). */
 void tls_free(struct tls_ctx *t);
 
-#endif /* MYOS_TLS_H */
+#endif /* PARASYTEOS_TLS_H */

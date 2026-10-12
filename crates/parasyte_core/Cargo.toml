@@ -1,5 +1,5 @@
 [package]
-name = "oscore"
+name = "parasyte_core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

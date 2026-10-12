@@ -1,4 +1,4 @@
-/* sh2: a proper shell for myos with PATH lookup, redirection, and job control.
+/* sh2: a proper shell for parasyteos with PATH lookup, redirection, and job control.
  *
  * Improvements over sh.c:
  * - PATH lookup: commands are searched in PATH directories
@@ -319,7 +319,7 @@ int main(void) {
     char line[MAX_LINE];
     init_path();
 
-    printf("myos shell v2\n");
+    printf("parasyteos shell v2\n");
     printf("Type 'exit' to quit.\n\n");
 
     for (;;) {

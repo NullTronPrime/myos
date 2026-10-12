@@ -12,8 +12,8 @@ use std::time::Duration;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
-const CLASS_NAME: &str = "myos_display";
-const WINDOW_TITLE: &str = "myos desktop";
+const CLASS_NAME: &str = "parasyteos_display";
+const WINDOW_TITLE: &str = "parasyteos desktop";
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 

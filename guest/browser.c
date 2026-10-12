@@ -1,4 +1,4 @@
-/* browser: a minimal graphical web browser for myos.
+/* browser: a minimal graphical web browser for parasyteos.
  *
  * One window: a URL bar on top, the page below, a status line at the
  * bottom. HTTP/1.1 over the guest socket layer (chunked bodies decoded),
@@ -89,9 +89,9 @@ struct input_event {
     unsigned int width, height;
 };
 
-/* Event kinds from oscore::input. */
+/* Event kinds from parasyte_core::input. */
 #define EV_KEYDOWN 1
-/* Modifier bits from oscore::input::Mods. */
+/* Modifier bits from parasyte_core::input::Mods. */
 #define MOD_CTRL 2
 #define EV_MOUSEDOWN 3
 #define EV_MOUSEUP 4
@@ -311,7 +311,7 @@ static int fetch_page(const char *url) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: parasyteos-browser\r\nConnection: close\r\n\r\n",
              path, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -461,18 +461,32 @@ static void walk_text(const char *s) {
     while (*s) {
         if (*s == '&') {
             const char *semi = strchr(s, ';');
-            if (semi && semi - s < 8) {
+            if (semi && semi - s < 10) {
                 size_t el = (size_t)(semi - s - 1);
-                char ent[10] = {0};
+                char ent[12] = {0};
                 memcpy(ent, s + 1, el);
                 char ec = 0;
+                int numeric = 0;
                 if (strcmp(ent, "amp") == 0) ec = '&';
                 else if (strcmp(ent, "lt") == 0) ec = '<';
                 else if (strcmp(ent, "gt") == 0) ec = '>';
                 else if (strcmp(ent, "quot") == 0) ec = '"';
                 else if (strcmp(ent, "nbsp") == 0) ec = ' ';
-                if (ec) {
-                    walk_char((unsigned char)ec);
+                else if (ent[0] == '#') {
+                    /* Numeric reference: decimal or hex. Anything the
+                     * 8x8 font cannot draw becomes '?'. */
+                    unsigned long v = 0;
+                    if ((ent[1] == 'x' || ent[1] == 'X') && ent[2]) {
+                        v = strtoul(ent + 2, NULL, 16);
+                        numeric = 1;
+                    } else if (ent[1]) {
+                        v = strtoul(ent + 1, NULL, 10);
+                        numeric = 1;
+                    }
+                    if (numeric) ec = (v > 0 && v < 128) ? (char)v : '?';
+                }
+                if (ec || numeric) {
+                    walk_char((unsigned char)(ec ? ec : '?'));
                     s = semi + 1;
                     continue;
                 }
@@ -488,13 +502,15 @@ static int walk_block_tag(int tag) {
            (tag >= TAG_H1 && tag <= TAG_H6);
 }
 
-/* First pass over the tree: words + link spans. */
+/* First pass over the tree: words + link spans. Element boundaries
+ * break words (the old streaming tokenizer flushed at every tag). */
 static void walk_node(struct dom_node *n) {
     if (!n) return;
     if (n->text) {
         walk_text(n->text);
         return;
     }
+    WFLUSH();
     if (n->tag == TAG_HEAD || n->tag == TAG_SCRIPT || n->tag == TAG_STYLE ||
         n->tag == TAG_NOSCRIPT) {
         return; /* head, scripts and styles never render */
@@ -510,6 +526,7 @@ static void walk_node(struct dom_node *n) {
             nlinks++;
         }
         for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
+        WFLUSH(); /* trailing fragment keeps this link, not the next */
         walk_link = save;
         return;
     }
@@ -547,6 +564,7 @@ static void walk_node(struct dom_node *n) {
             links[nlinks].field = n;
             nlinks++;
             walk_text(cell);
+            WFLUSH(); /* trailing fragment keeps this link, not the next */
             walk_link = save;
         }
         return;
@@ -794,7 +812,7 @@ static long stream_to_file(const char *url, const char *path) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: parasyteos-browser\r\nConnection: close\r\n\r\n",
              upath, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -1214,12 +1232,6 @@ static void click_page(int px, int py) {
     int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
     int r = (py - CHROME_H) / CHAR_H;
     int c = px / CHAR_W;
-    fprintf(stderr, "browser: click x=%d y=%d r=%d c=%d nlinks=%d nlines=%d\n", px, py, r, c,
-            nlinks, nlines);
-    for (int k = 0; k < nlinks; k++)
-        fprintf(stderr, "browser: link %d row=%d c0=%d c1=%d field=%p url=%.20s\n", k,
-                links[k].row, links[k].c0, links[k].c1, (void *)links[k].field,
-                links[k].url);
     if (r < 0 || r >= rows) return;
     int lr = scroll + r;
     if (lr < 0 || lr >= nlines) return;
@@ -1425,7 +1437,7 @@ int main(int argc, char **argv) {
     present();
 
     /* Embedded mode follows the desktop's app area (see geom file). */
-    int embedded = getenv("MYOS_EMBED_PARENT") != NULL;
+    int embedded = getenv("PARASYTEOS_EMBED_PARENT") != NULL;
     int geom_tick = 0;
     struct pollfd pfd = { .fd = input_fd, .events = POLLIN };
     for (;;) {

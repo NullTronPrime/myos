@@ -1,4 +1,4 @@
-# myos
+# parasyteos
 
 A library OS that runs as an ordinary Linux process. There is no bootloader, no
 hypervisor and no emulation: the launcher loads a guest ELF *into its own address
@@ -7,28 +7,28 @@ from Rust. It is parasitic by design — it borrows a Linux process the way a
 library OS borrows its host.
 
 ```
-crates/oscore   host-testable core :implements address space, frames,
+crates/parasyte_core   host-testable core :implements address space, frames,
                 memory, VFS, ELF, relocation, graphics, syscall dispatcher
-crates/osplat   Linux specific layer:implements ELF loader, SIGSYS trap handler,
+crates/parasyte_plat   Linux specific layer:implements ELF loader, SIGSYS trap handler,
                 host process/pipe/fd plumbing
-crates/myos     the launcher binary
+crates/parasyteos     the launcher binary
 guest/          guest programs and the self-hosted C library (`minic`)
 scripts/        build and run helpers
 ```
 
 ## How it works
 
-- **Hosted kernel.** `myos` maps the guest image (optionally followed by the
+- **Hosted kernel.** `parasyteos` maps the guest image (optionally followed by the
   host's own `ld.so` for dynamic guests), builds a SysV initial stack, and transfers
   to the entry point in a forked child.
 - **Seccomp + SIGSYS.** A seccomp filter traps syscalls. Calls issued from guest
-  code (below 4 GiB) are serviced by `oscore`; calls issued by host libraries
+  code (below 4 GiB) are serviced by `parasyte_core`; calls issued by host libraries
   (above 4 GiB) pass straight through, so the kernel can still use real syscalls.
 - **In-process `execve`.** `execve` resets caught signal handlers, so the
   launcher re-execs itself in `--exec` mode and re-arms only the trap handler.
 - **Self-hosting.** Guests can be built with no host libc at all, against
   `guest/lib/minic.c` + `guest/lib/crt0.S`. Static PIE images are relocated by
-  the kernel side of the loader (`oscore::link`).
+  the kernel side of the loader (`parasyte_core::link`).
 
 ## Requirements
 
@@ -37,7 +37,7 @@ scripts/        build and run helpers
 - `gcc` to build the guest programs.
 - `readelf` is optional (used by the contract tests).
 - For sound: `ffmpeg` and `pulseaudio-utils` (`paplay`), or set
-  `MYOS_AUDIO_CMD` to redirect playback.
+  `PARASYTEOS_AUDIO_CMD` to redirect playback.
 - For the local-TLS and network contract tests: `python3`, `openssl`.
 - For live windows: an X server (WSLg on Windows, X11 on Linux).
 
@@ -45,14 +45,14 @@ scripts/        build and run helpers
 
 ```sh
 scripts/build.sh      # builds the kernel + guests + assembles target/rootfs
-scripts/run.sh        # opens the myos shell
+scripts/run.sh        # opens the parasyteos shell
 scripts/live.sh desktop_shell            # full desktop in a live window (WSLg/X11)
 scripts/live.sh browser <url>            # browser alone, live
 scripts/shot.sh browser <url>            # headless screenshot to target/shots/
 scripts/snd.sh song.mp3 song.u8          # convert audio to 8-bit for /dev/audio
 ```
 
-`scripts/run.sh` sets `MYOS_ROOT=target/rootfs`, which backs the guest's `/`.
+`scripts/run.sh` sets `PARASYTEOS_ROOT=target/rootfs`, which backs the guest's `/`.
 Type commands at the prompt, or pipe them in:
 
 ```sh
@@ -62,21 +62,21 @@ printf '/bin/catfile /etc/motd\nexit\n' | scripts/run.sh
 Run a single program without a rootfs:
 
 ```sh
-target/release/myos target/guest/hello
-target/release/myos target/guest/pie_guest
+target/release/parasyteos target/guest/hello
+target/release/parasyteos target/guest/pie_guest
 ```
 
-With no `MYOS_ROOT`, the guest filesystem starts from a built-in initrd
+With no `PARASYTEOS_ROOT`, the guest filesystem starts from a built-in initrd
 (`/motd`, `/version`).
 
 ### Display
 
-Guests can draw into an offscreen window system. `MYOS_DISPLAY` sets the screen
-size and `MYOS_FB_OUT` writes a PPM of the final frame:
+Guests can draw into an offscreen window system. `PARASYTEOS_DISPLAY` sets the screen
+size and `PARASYTEOS_FB_OUT` writes a PPM of the final frame:
 
 ```sh
-MYOS_DISPLAY=64x48 MYOS_FB_OUT=frame.ppm \
-  target/release/myos target/guest/fb_paint text
+PARASYTEOS_DISPLAY=64x48 PARASYTEOS_FB_OUT=frame.ppm \
+  target/release/parasyteos target/guest/fb_paint text
 ```
 
 ## Writing a guest
@@ -88,7 +88,7 @@ Any static ELF works. For a guest with no host libc, include `minic.h` and link
 #include "minic.h"
 
 int main(void) {
-    printf("hello from myos\n");
+    printf("hello from parasyteos\n");
     return 0;
 }
 ```
@@ -107,8 +107,8 @@ and the DOM bindings — all runnable headless under WSL2.
 
 ```sh
 bash guest/contracts.sh
-cargo test -p oscore --lib   # 337 kernel unit tests
-cargo test -p osplat --lib   # platform tests (keymap, loader, …)
+cargo test -p parasyte_core --lib   # 337 kernel unit tests
+cargo test -p parasyte_plat --lib   # platform tests (keymap, loader, …)
 ```
 
 ## Capabilities
@@ -118,7 +118,7 @@ cargo test -p osplat --lib   # platform tests (keymap, loader, …)
 ptys (`/dev/ptmx`, `grantpt`, job control), pipes, shared memory (`memfd`,
 `shm_open`), and environment inheritance rules that keep the dynamic linker
 hermetic (empty guest env by design; the re-exec trampoline forwards only
-`DISPLAY`/`MYOS_*`).
+`DISPLAY`/`PARASYTEOS_*`).
 
 **Display.** A real X11 client (hand-rolled protocol, no toolkit): live windows
 at ~60fps with damage tracking, plus headless PPM snapshots. Windows support
@@ -168,7 +168,7 @@ loudly per-script instead of silently.
 **Sound.** 8-bit minimalist: write unsigned 8-bit mono 8000 Hz PCM to
 `/dev/audio` and the kernel streams it to the host player (PulseAudio).
 `scripts/snd.sh` converts anything ffmpeg reads; `beep [freq]` tests the path;
-`MYOS_AUDIO_CMD` redirects playback (e.g. `tee /tmp/cap.u8`) for headless tests.
+`PARASYTEOS_AUDIO_CMD` redirects playback (e.g. `tee /tmp/cap.u8`) for headless tests.
 
 **Tools.** `js` runs scripts/files under the trap (`print`, real exit codes);
 `beep` checks audio; `fetch` probes the network; `dom_test`/`jsdom_test`/

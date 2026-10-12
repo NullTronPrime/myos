@@ -2,7 +2,7 @@
 //!
 //! The dispatcher is a pure function from `(nr, args, &mut Guest)` to a return
 //! value. Nothing here touches the host, so every syscall's logic is testable
-//! by constructing a guest state and calling it directly. The `osplat` layer
+//! by constructing a guest state and calling it directly. The `parasyte_plat` layer
 //! only has to move registers in and out.
 
 use crate::addr::{Perms, PAGE_SIZE};
@@ -62,7 +62,7 @@ pub const SYS_GETGID: i64 = 104;
 pub const SYS_GETEUID: i64 = 107;
 pub const SYS_GETEGID: i64 = 108;
 pub const SYS_GETPPID: i64 = 110;
-/// Process-group and session syscalls, delegated to the host in `osplat`.
+/// Process-group and session syscalls, delegated to the host in `parasyte_plat`.
 /// Only the guest's own group is addressable (one guest per host process,
 // like `kill`); anything else reports `ESRCH`.
 pub const SYS_SETPGID: i64 = 109;
@@ -200,7 +200,7 @@ pub const SYS_WINDOW_GET_TITLE: i64 = 0x1016;
 /// Returns this client's outer host-window id (for embedding rendezvous).
 ///
 /// The desktop publishes it under `/winserv/desktop/xid` so launched apps
-/// can reparent into it via `MYOS_EMBED_PARENT`. Negative errno when there
+/// can reparent into it via `PARASYTEOS_EMBED_PARENT`. Negative errno when there
 /// is no display server.
 pub const SYS_DISPLAY_XID: i64 = 0x1017;
 /// The descriptor to read input events from, allocated on first call.
@@ -591,7 +591,7 @@ pub struct MmapRequest {
 }
 
 /// Guest memory accessor, kept as a trait so tests can supply a simulated
-/// space and `osplat` can supply the real one.
+/// space and `parasyte_plat` can supply the real one.
 pub trait GuestMemory {
     fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno>;
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno>;
@@ -2761,7 +2761,7 @@ mod tests {
 
     #[test]
     fn sockets_are_trap_delegated_not_dispatched() {
-        // Sockets own host kernel objects, so only `osplat::trap` (which can
+        // Sockets own host kernel objects, so only `parasyte_plat::trap` (which can
         // allocate host fds) serves them; the pure dispatcher answers
         // `Nosys`, exactly like `fork`/`clone`.
         let vfs: &'static mut Vfs = Box::leak(Box::new(Vfs::new()));
@@ -3315,7 +3315,7 @@ mod tests {
         assert_eq!(dispatch(&r, &mut g, &mut s, &mut f), Ok(0));
         let buf = g.read(0x1000_0c00, 5 * 65).unwrap();
         assert_eq!(&buf[0..5], b"Linux");
-        assert_eq!(&buf[65..69], b"myos");
+        assert_eq!(&buf[65..75], b"parasyteos");
         // Every field must terminate inside its own 65 bytes.
         for i in 0..5 {
             let field = &buf[i * 65..(i + 1) * 65];

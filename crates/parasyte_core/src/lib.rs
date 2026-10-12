@@ -1,8 +1,8 @@
-//! oscore: the pure, host-testable core of the parasitic OS.
+//! parasyte_core: the pure, host-testable core of the parasitic OS.
 //!
 //! Every module here compiles for Windows, Linux and macOS and is exercised by
 //! `cargo test` without a VM, without a bootloader and without root. The host
-//! bindings live in `osplat` and are the only code that cannot be tested this
+//! bindings live in `parasyte_plat` and are the only code that cannot be tested this
 //! way, which is the whole point of the split.
 
 #![warn(missing_docs)]
@@ -37,7 +37,7 @@ pub use vfs::{Errno, Vfs};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Kernel name reported to the guest.
-pub const NAME: &str = "myos";
+pub const NAME: &str = "parasyteos";
 
 /// Builds a `<name> <version>` string for `uname`.
 pub fn banner() -> String {

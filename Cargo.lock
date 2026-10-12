@@ -9,27 +9,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "myos"
-version = "0.1.0"
-dependencies = [
- "libc",
- "oscore",
- "osplat",
-]
-
-[[package]]
-name = "oscore"
+name = "parasyte_core"
 version = "0.1.0"
 dependencies = [
  "winapi",
 ]
 
 [[package]]
-name = "osplat"
+name = "parasyte_plat"
 version = "0.1.0"
 dependencies = [
  "libc",
- "oscore",
+ "parasyte_core",
+]
+
+[[package]]
+name = "parasyteos"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "parasyte_core",
+ "parasyte_plat",
 ]
 
 [[package]]

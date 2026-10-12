@@ -737,7 +737,7 @@ static JSValue xhr_send(JSContext *ctx, JSValueConst self, int argc, JSValueCons
     }
     char req[1024];
     snprintf(req, sizeof(req),
-             "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: myos-xhr\r\nConnection: close\r\n\r\n",
+             "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: parasyteos-xhr\r\nConnection: close\r\n\r\n",
              x->method[0] ? x->method : "GET", path, host);
     size_t left = strlen(req);
     const char *p = req;
@@ -1036,7 +1036,7 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
         JS_SetPropertyStr(ctx, global, "location", loc);
         JSValue nav = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, nav, "userAgent",
-                          JS_NewString(ctx, "myos-jsdom/1.0"));
+                          JS_NewString(ctx, "parasyteos-jsdom/1.0"));
         JS_SetPropertyStr(ctx, nav, "language", JS_NewString(ctx, "en-US"));
         JS_SetPropertyStr(ctx, nav, "platform", JS_NewString(ctx, "Linux x86_64"));
         JSValue langs = JS_NewArray(ctx);

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the myos kernel and its guest programs, then assemble a rootfs.
+# Build the parasyteos kernel and its guest programs, then assemble a rootfs.
 #
 # This is the "use it" path. Validation lives in guest/contracts.sh and is
 # intentionally not run here.
@@ -38,7 +38,7 @@ done
     third_party/quickjs/dtoa.c third_party/quickjs/libregexp.c \
     third_party/quickjs/libunicode.c third_party/quickjs/cutils.c -lm
 
-# A dynamically linked guest: exercises PT_INTERP + host ld.so inside myos.
+# A dynamically linked guest: exercises PT_INTERP + host ld.so inside parasyteos.
 "$cc" -O2 -o "$out/dyn_hello" guest/dyn_hello.c
 
 # Guests built only against our self-hosted C library (no host libc at all):
@@ -59,10 +59,10 @@ done
 cp "$out/sh" "$out/sh2" "$out/init" "$out/window_server" "$out/desktop_shell" "$out/terminal" \
    "$out/dyn_hello" "$out/pie_guest" "$out/selfhost" \
    "$out/catfile" "$out/catstdin" "$out/fetch" "$out/browser" "$out/beep" "$out/js" "$root/bin/"
-printf 'myos: parasitic kernel, running inside a process.\n' > "$root/etc/motd"
+printf 'parasyteos: parasitic kernel, running inside a process.\n' > "$root/etc/motd"
 printf 'os-1.0\n' > "$root/etc/version"
 
 echo
-echo "kernel: target/release/myos"
+echo "kernel: target/release/parasyteos"
 echo "rootfs: $root"
-echo "shell:  MYOS_ROOT=$root target/release/myos $out/sh"
+echo "shell:  PARASYTEOS_ROOT=$root target/release/parasyteos $out/sh"

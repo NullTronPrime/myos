@@ -1,17 +1,17 @@
 [package]
-name = "myos"
+name = "parasyteos"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "A parasitic OS: a kernel that runs as an ordinary Linux process."
 
 [[bin]]
-name = "myos"
+name = "parasyteos"
 path = "src/main.rs"
 
 [dependencies]
-oscore = { workspace = true }
-osplat = { workspace = true }
+parasyte_core = { workspace = true }
+parasyte_plat = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

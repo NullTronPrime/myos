@@ -5,7 +5,7 @@
 //! in `gregs[]`, indexed by the `REG_*` constants.
 
 use libc::{c_void, greg_t, ucontext_t};
-use oscore::syscall::{Registers, MAX_ARGS};
+use parasyte_core::syscall::{Registers, MAX_ARGS};
 
 /// Index of `rax` in `ucontext_t::gregs`. Holds the syscall number on entry.
 pub const REG_RAX: usize = libc::REG_RAX as usize;

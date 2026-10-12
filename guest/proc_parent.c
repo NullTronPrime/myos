@@ -1,6 +1,6 @@
 // Parent for the process-model contract test.
 //
-// Forks, execs the child (argv[1]) through the myos `execve` trampoline, and
+// Forks, execs the child (argv[1]) through the parasyteos `execve` trampoline, and
 // reaps it with `wait4`, reporting the child's exit status.
 #include <stdio.h>
 #include <stdlib.h>

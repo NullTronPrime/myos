@@ -6,16 +6,16 @@
 //! image in-process keeps the handler alive across the transition.
 //!
 //! Everything here is host-facing and unsafe; the parsing and validation it
-//! relies on lives in `oscore::elf` and is unit-tested.
+//! relies on lives in `parasyte_core::elf` and is unit-tested.
 
 use libc::{
     c_void, MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, PROT_EXEC,
     PROT_READ, PROT_WRITE,
 };
-use oscore::addr::{align_down, align_up, PAGE_SIZE};
-use oscore::elf::class::Type;
-use oscore::elf::ElfImage;
-use oscore::Perms;
+use parasyte_core::addr::{align_down, align_up, PAGE_SIZE};
+use parasyte_core::elf::class::Type;
+use parasyte_core::elf::ElfImage;
+use parasyte_core::Perms;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
@@ -80,10 +80,10 @@ pub struct Loaded {
 /// Returns the names of shared libraries the guest depends on. These are
 /// resolved against the rootfs's `lib/` directory.
 fn parse_dt_needed(image: &ElfImage, bytes: &[u8]) -> Vec<String> {
-    let Some(ph) = image.segments.iter().find(|p| p.ptype == oscore::elf::PT_DYNAMIC) else {
+    let Some(ph) = image.segments.iter().find(|p| p.ptype == parasyte_core::elf::PT_DYNAMIC) else {
         return Vec::new();
     };
-    let Ok(entries) = oscore::link::dynamic_table(bytes, ph) else {
+    let Ok(entries) = parasyte_core::link::dynamic_table(bytes, ph) else {
         return Vec::new();
     };
     // Find DT_STRTAB and DT_STRSZ
@@ -91,7 +91,7 @@ fn parse_dt_needed(image: &ElfImage, bytes: &[u8]) -> Vec<String> {
     let mut strsz: u64 = 0;
     for &(tag, val) in &entries {
         match tag {
-            oscore::link::DT_STRTAB => strtab = Some(val as u64),
+            parasyte_core::link::DT_STRTAB => strtab = Some(val as u64),
             10 => strsz = val as u64, // DT_STRSZ
             _ => {}
         }
@@ -100,13 +100,13 @@ fn parse_dt_needed(image: &ElfImage, bytes: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     // Translate strtab address to file offset
-    let strtab_offset = match oscore::link::vaddr_to_file(image, strtab_addr) {
+    let strtab_offset = match parasyte_core::link::vaddr_to_file(image, strtab_addr) {
         Some(off) => off,
         None => return Vec::new(),
     };
     let mut out = Vec::new();
     for &(tag, val) in &entries {
-        if tag == oscore::link::DT_NEEDED {
+        if tag == parasyte_core::link::DT_NEEDED {
             // val is an offset into the string table
             let offset = strtab_offset + val as u64;
             let start = offset as usize;
@@ -165,7 +165,7 @@ pub fn prepare(
         match try_load_shared_lib(lib, root.as_deref()) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!("myos: leaving {lib} to the guest dynamic linker");
+                eprintln!("parasyteos: leaving {lib} to the guest dynamic linker");
             }
             Err(e) => return Err(e),
         }
@@ -285,11 +285,11 @@ fn try_load_shared_lib(name: &str, root: Option<&Path>) -> Result<bool, String> 
     map_segments(&image, &bytes, base)?;
 
     // Apply relocations
-    let relocs = oscore::link::relocations(&bytes, &image)
+    let relocs = parasyte_core::link::relocations(&bytes, &image)
         .map_err(|e| format!("cannot read relocations in {name}: {}", e.as_str()))?;
     if !relocs.is_empty() {
         let mut stores: Vec<(u64, u64)> = Vec::with_capacity(relocs.len());
-        oscore::link::apply_static(&relocs, base, |addr, value| stores.push((addr, value)))
+        parasyte_core::link::apply_static(&relocs, base, |addr, value| stores.push((addr, value)))
             .map_err(|t| format!("unsupported relocation type {t} in {name}"))?;
         for (addr, value) in stores {
             unsafe { *(addr as *mut u64) = value };
@@ -307,7 +307,7 @@ fn try_load_shared_lib(name: &str, root: Option<&Path>) -> Result<bool, String> 
 /// map. The stores land in segments the program headers mark writable, which is
 /// why this can run after `map_segments` applied the final protections.
 fn apply_static_relocations(image: &ElfImage, bytes: &[u8], base: u64) -> Result<(), String> {
-    let relocs = oscore::link::relocations(bytes, image)
+    let relocs = parasyte_core::link::relocations(bytes, image)
         .map_err(|e| format!("cannot read dynamic relocations: {}", e.as_str()))?;
     if relocs.is_empty() {
         return Ok(());
@@ -315,7 +315,7 @@ fn apply_static_relocations(image: &ElfImage, bytes: &[u8], base: u64) -> Result
     // Gather first so a bad relocation type is rejected before any store
     // touches the image.
     let mut stores: Vec<(u64, u64)> = Vec::with_capacity(relocs.len());
-    oscore::link::apply_static(&relocs, base, |addr, value| stores.push((addr, value)))
+    parasyte_core::link::apply_static(&relocs, base, |addr, value| stores.push((addr, value)))
         .map_err(|t| format!("unsupported relocation type {t} in a static PIE"))?;
     for (addr, value) in stores {
         unsafe { *(addr as *mut u64) = value };
@@ -457,7 +457,7 @@ fn ensure_unmapped(
             return Err(format!(
                 "guest would be loaded at {want_lo:#x}..{want_hi:#x}, \
                  which overlaps existing mapping {s:#x}..{e:#x}; \
-                 the guest must not be a fixed-address image that collides with myos"
+                 the guest must not be a fixed-address image that collides with parasyteos"
             ));
         }
     }
@@ -717,10 +717,10 @@ fn prot_bits(perms: Perms) -> i32 {
 }
 
 std::arch::global_asm!(
-    ".globl __myos_enter",
-    ".hidden __myos_enter",
-    ".type __myos_enter,@function",
-    "__myos_enter:",
+    ".globl __parasyteos_enter",
+    ".hidden __parasyteos_enter",
+    ".type __parasyteos_enter,@function",
+    "__parasyteos_enter:",
     "mov rsp, rsi",
     // A freshly exec'd static image starts with every register but `rsp` zeroed
     // by the kernel. `_start` reads `%rdx` as `rtld_fini` and pushes `%rax`;
@@ -740,11 +740,11 @@ std::arch::global_asm!(
     "xor r14d, r14d",
     "xor r15d, r15d",
     "jmp rdi",
-    ".size __myos_enter, .-__myos_enter",
+    ".size __parasyteos_enter, .-__parasyteos_enter",
 );
 
 extern "C" {
-    fn __myos_enter(entry: u64, stack_top: u64) -> !;
+    fn __parasyteos_enter(entry: u64, stack_top: u64) -> !;
 }
 
 /// Transfers control to a loaded guest. Never returns.
@@ -754,7 +754,7 @@ extern "C" {
 /// `entry` and `stack_top` must come from [`prepare`] for an image that is still
 /// mapped. After this call the guest owns the thread.
 pub unsafe fn enter(entry: u64, stack_top: u64) -> ! {
-    __myos_enter(entry, stack_top)
+    __parasyteos_enter(entry, stack_top)
 }
 
 #[cfg(test)]

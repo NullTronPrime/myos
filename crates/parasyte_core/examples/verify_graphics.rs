@@ -1,6 +1,6 @@
 //! Verifies the visual_test.ppm output pixel by pixel.
 //!
-//! Run: cargo run -p oscore --example verify_graphics
+//! Run: cargo run -p parasyte_core --example verify_graphics
 
 use std::fs;
 

@@ -1,7 +1,7 @@
 //! Physical memory abstraction and a pure-Rust simulator for it.
 //!
 //! `MemBackend` is the seam that makes the rest of the kernel testable. The
-//! real implementation in `osplat` mmaps host memory; the simulator here is a
+//! real implementation in `parasyte_plat` mmaps host memory; the simulator here is a
 //! `Vec<u8>` that pretends to be RAM. Every layer above this trait is
 //! exercised against the simulator in unit tests, so paging bugs surface as
 //! assertion failures rather than as crashes inside a booted kernel.

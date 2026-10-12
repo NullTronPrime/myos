@@ -214,7 +214,7 @@ static int build_desktop(unsigned int w, unsigned int h) {
     panel_buf = (unsigned long)syscall(SYS_WINDOW_MAP, panel_win, &panel_info, 0, 0, 0, 0);
     if (panel_buf == 0) return die("window_map panel");
     syscall(SYS_WINDOW_MOVE, panel_win, 0, (int)h - PANEL_HEIGHT, 0, 0, 0);
-    syscall(SYS_WINDOW_SET_TITLE, panel_win, "myos panel", 0, 0, 0, 0);
+    syscall(SYS_WINDOW_SET_TITLE, panel_win, "parasyteos panel", 0, 0, 0, 0);
     draw_panel(panel_buf, panel_info.width, panel_info.height);
     syscall(SYS_WINDOW_PRESENT, panel_win, 0, 0, 0, 0, 0);
     /* Publish the app area so embedded windows can follow resizes. */
@@ -335,7 +335,7 @@ static void launch_app(const char *cmd) {
         int ne = 0;
         envp[ne++] = "PATH=/bin:/usr/bin";
         envp[ne++] = "HOME=/";
-        envp[ne++] = "TERM=myos";
+        envp[ne++] = "TERM=parasyteos";
         /* The browser lives INSIDE the desktop window: its outer X
          * window reparents into ours (one OS window on the host),
          * sized to the area above the panel. */
@@ -343,13 +343,13 @@ static void launch_app(const char *cmd) {
             long xid = desktop_xid();
             if (xid > 0) {
                 snprintf(embed_parent, sizeof(embed_parent),
-                         "MYOS_EMBED_PARENT=%li", xid);
+                         "PARASYTEOS_EMBED_PARENT=%li", xid);
                 envp[ne++] = embed_parent;
                 /* Guest model and host window must agree exactly: any
                  * mismatch sends every frame down the resize path. */
-                envp[ne++] = "MYOS_WIDTH=640";
-                envp[ne++] = "MYOS_HEIGHT=448";
-                envp[ne++] = "MYOS_DISPLAY=640x448";
+                envp[ne++] = "PARASYTEOS_WIDTH=640";
+                envp[ne++] = "PARASYTEOS_HEIGHT=448";
+                envp[ne++] = "PARASYTEOS_DISPLAY=640x448";
             }
         }
         envp[ne] = NULL;
@@ -377,7 +377,7 @@ int main(void) {
     if (build_desktop(disp_w, disp_h) < 0) return 1;
 
     // Composite every visible window into one frame. The kernel writes
-    // it to MYOS_FB_OUT (or pushes it to the real window) when this
+    // it to PARASYTEOS_FB_OUT (or pushes it to the real window) when this
     // syscall returns.
     long pr = syscall(SYS_DISPLAY_PRESENT, 0, 0, 0, 0, 0, 0);
     fprintf(stderr, "desktop_shell: display_present returned %ld\n", pr);

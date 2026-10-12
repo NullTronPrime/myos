@@ -1,12 +1,12 @@
-/* dom: a tiny HTML node tree for myos guests (guest/lib/dom.c).
+/* dom: a tiny HTML node tree for parasyteos guests (guest/lib/dom.c).
  *
  * The browser used to tokenize straight into layout. Scripts need something
  * to manipulate, so parsing now builds a tree first and layout walks it.
  * Toy-grade: no namespaces, no frames, no CSS, misnesting is repaired by
  * popping to the matching open tag, and unknown tags stay in the tree.
  */
-#ifndef MYOS_DOM_H
-#define MYOS_DOM_H
+#ifndef PARASYTEOS_DOM_H
+#define PARASYTEOS_DOM_H
 
 #include <stddef.h>
 
@@ -77,4 +77,4 @@ char *dom_text_content(const struct dom_node *n);
  * which belongs to the tree). Returns count. */
 int dom_scripts(struct dom_doc *doc, const char ***out);
 
-#endif /* MYOS_DOM_H */
+#endif /* PARASYTEOS_DOM_H */

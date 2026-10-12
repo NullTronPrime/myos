@@ -1,6 +1,6 @@
 // Child for the process-model contract test.
 //
-// Loaded through `myos --exec`, so its `getpid` must be the host pid and its
+// Loaded through `parasyteos --exec`, so its `getpid` must be the host pid and its
 // exit status must propagate to the parent's `wait4`. Also reads one line from
 // stdin to prove `read(0)` is wired to the host.
 #include <stdio.h>

@@ -1,13 +1,13 @@
 //! Pure pseudo-terminal model for Phase 2.1.
 //!
-//! Host `openpt`/`grantpt`/`ptsname` live in `osplat` and cannot run under
+//! Host `openpt`/`grantpt`/`ptsname` live in `parasyte_plat` and cannot run under
 //! `cargo test` on Windows. This module is the testable half: allocation,
 //! line discipline, window size and foreground process group, expressed over
 //! plain byte queues so `guest/terminal.c` behaviour can be asserted without
 //! a host pty.
 //!
 //! The trap layer already delegates `SYS_OPENPT` et al to the host when its
-//! hooks are installed (`osplat::trap`). When they are absent (tests, or a
+//! hooks are installed (`parasyte_plat::trap`). When they are absent (tests, or a
 //! headless build), this table is the in-memory fallback the dispatcher can
 //! drive directly.
 

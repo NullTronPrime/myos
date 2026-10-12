@@ -1,8 +1,8 @@
-/* minic: the myos self-hosted C library.
+/* minic: the parasyteos self-hosted C library.
  *
  * Guests built with `-nostdlib` link against this instead of glibc, so they run
  * with no host libc and no dynamic linker. Only the pieces our guests actually
- * use are provided; everything bottoms out in a raw `syscall` that myos traps
+ * use are provided; everything bottoms out in a raw `syscall` that parasyteos traps
  * and services. */
 #ifndef MINIC_H
 #define MINIC_H

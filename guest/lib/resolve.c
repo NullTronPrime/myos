@@ -253,6 +253,17 @@ int resolve_host(const char *name, struct in_addr *out) {
     return -1;
 }
 
+/* Bounds every read and write: servers that accept and then go silent
+ * (tarpits, throttles) would otherwise stall the guest forever. Callers
+ * already tolerate truncated responses. */
+static void sock_timeout(int fd) {
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 int tcp_connect_timeout(const struct in_addr *addr, int port, int ms) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -328,15 +339,6 @@ int tcp_connect_timeout(const struct in_addr *addr, int port, int ms) {
         errno = e;
         return -1;
     }
-    /* Bound every read and write: servers that accept and then go silent
-     * (tarpits, throttles) would otherwise stall the guest forever. The
-     * callers already tolerate truncated responses. */
-    {
-        struct timeval tv;
-        tv.tv_sec = 15;
-        tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
+    sock_timeout(fd);
     return fd;
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Contract tests for the seccomp/SIGSYS behaviours myos depends on.
+# Contract tests for the seccomp/SIGSYS behaviours parasyteos depends on.
 #
 # Each probe pins a kernel behaviour that was established empirically while
 # fixing the trap layer. They need a Linux kernel with CONFIG_SECCOMP_FILTER
@@ -41,7 +41,7 @@ has "returned 39" "$r" && ok "rip is already past the syscall on entry" || bad "
 
 # 4. execve resets caught signal dispositions, so a guest exec'd under the
 #    filter loses the SIGSYS handler and dies on its first trapped syscall.
-#    This is why myos loads the guest in-process rather than exec'ing it.
+#    This is why parasyteos loads the guest in-process rather than exec'ing it.
 "$cc" -O0 -o "$out/trap_parent" trap_parent.c || exit 1
 "$cc" -O0 -o "$out/trap_child" trap_child.c || exit 1
 "$out/trap_parent" "$out/trap_child" >/dev/null 2>&1
@@ -62,14 +62,14 @@ has "low stub returned 0xabc" "$r" && ok "handler services the low-address call"
 [[ $? -eq 0 ]] && ok "high-address (libc) syscalls pass through" \
               || bad "ip_probe rejected a high-address syscall"
 
-# 6. End to end under myos: a static guest's write is trapped and flushed, and
+# 6. End to end under parasyteos: a static guest's write is trapped and flushed, and
 #    openat/read/close are serviced by the in-memory VFS.
-MYOS=../target/release/myos
-if [[ -x $MYOS ]]; then
+PARASYTEOS=../target/release/parasyteos
+if [[ -x $PARASYTEOS ]]; then
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/hello" lib/crt0.S lib/minic.c hello.c || exit 1
-    r=$("$MYOS" "$out/hello" 2>/dev/null)
-    has "write trapped and serviced by myos" "$r" && ok "guest write is trapped and flushed" \
+    r=$("$PARASYTEOS" "$out/hello" 2>/dev/null)
+    has "write trapped and serviced by parasyteos" "$r" && ok "guest write is trapped and flushed" \
         || bad "hello write: $r"
     has "parasitic kernel, running inside a process" "$r" \
         && ok "openat/read/close are serviced by the VFS" || bad "hello vfs read: $r"
@@ -82,7 +82,7 @@ if [[ -x $MYOS ]]; then
     #    recorded, so the run must die on SIGSEGV instead.
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/prot_probe" lib/crt0.S lib/minic.c prot_probe.c || exit 1
-    r=$("$MYOS" "$out/prot_probe" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/prot_probe" 2>/dev/null); rc=$?
     # The guest is killed mid-line by SIGSEGV, so the last marker can be cut
     # short; match on prefixes that survive truncation.
     has "wrote-while-rw" "$r" && ok "page is writable before mprotect" \
@@ -99,7 +99,7 @@ if [[ -x $MYOS ]]; then
     # 8. mmap and brk are mediated: the dispatcher decides, the host realises.
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/mem_probe" lib/crt0.S lib/minic.c mem_probe.c || exit 1
-    r=$("$MYOS" "$out/mem_probe" 2>/dev/null)
+    r=$("$PARASYTEOS" "$out/mem_probe" 2>/dev/null)
     has "mmap-ok" "$r" && ok "mmap is mediated into a real mapping" \
         || bad "mem_probe mmap: $r"
     has "brk-ok" "$r" && ok "brk growth is realised by the host" \
@@ -111,7 +111,7 @@ if [[ -x $MYOS ]]; then
     #    interpreter's own (host) syscalls, and the initial-stack layout all at
     #    once, so a stack-contiguity or auxv regression shows up here.
     "$cc" -O2 -o "$out/dyn_hello" dyn_hello.c || exit 1
-    r=$("$MYOS" "$out/dyn_hello" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/dyn_hello" 2>/dev/null); rc=$?
     has "dyn ok 15" "$r" && ok "dynamic PIE guest runs (ld.so + libc loaded)" \
         || bad "dyn_hello output: $r (rc=$rc)"
     [ "$rc" -eq 42 ] && ok "dynamic guest exit status is propagated" \
@@ -123,12 +123,12 @@ if [[ -x $MYOS ]]; then
     #     getpid is real and read(0) is wired to stdin.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/proc_parent" proc_parent.c || exit 1
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/proc_child"  proc_child.c  || exit 1
-    r=$(printf 'hello-stdin\n' | "$MYOS" "$out/proc_child" 2>/dev/null); rc=$?
+    r=$(printf 'hello-stdin\n' | "$PARASYTEOS" "$out/proc_child" 2>/dev/null); rc=$?
     has "child read=hello-stdin" "$r" && ok "guest read(0) is wired to stdin" \
         || bad "proc_child stdin: $r (rc=$rc)"
     [ "$rc" -eq 7 ] && ok "proc_child exit status is real" \
         || bad "expected proc_child exit 7, got $rc"
-    r=$(printf 'hi\n' | "$MYOS" "$out/proc_parent" "$out/proc_child" 2>/dev/null); rc=$?
+    r=$(printf 'hi\n' | "$PARASYTEOS" "$out/proc_parent" "$out/proc_child" 2>/dev/null); rc=$?
     has "parent reaped" "$r" && has "status=7" "$r" && ok "fork + execve + wait4 round-trips" \
         || bad "proc_parent: $r (rc=$rc)"
     [ "$rc" -eq 42 ] && ok "parent exit status is propagated" \
@@ -138,7 +138,7 @@ if [[ -x $MYOS ]]; then
     #     errno (exit 127), and child statuses propagated.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/sh" sh.c || exit 1
     r=$(printf '%s\n%s\n%s\nexit\n' "$out/dyn_hello" "$out/dyn_hello" /no/such/prog \
-        | "$MYOS" "$out/sh" 2>&1); rc=$?
+        | "$PARASYTEOS" "$out/sh" 2>&1); rc=$?
     has "dyn ok 15" "$r" && has "exited 42" "$r" && ok "shell runs guests and reports status" \
         || bad "sh dyn_hello: $r (rc=$rc)"
     has "exec: No such file or directory" "$r" && has "exited 127" "$r" \
@@ -146,7 +146,7 @@ if [[ -x $MYOS ]]; then
     has "sh: bye" "$r" && [ "$rc" -eq 0 ] && ok "shell exits cleanly on 'exit'" \
         || bad "expected sh exit 0, got $rc ($r)"
 
-    # 12. Rootfs: MYOS_ROOT makes a host directory back the guest's `/`. Files
+    # 12. Rootfs: PARASYTEOS_ROOT makes a host directory back the guest's `/`. Files
     #     are pulled into the VFS, and execve resolves guest paths inside it.
     root="$out/rootfs"
     rm -rf "$root"; mkdir -p "$root/bin" "$root/etc"
@@ -154,20 +154,20 @@ if [[ -x $MYOS ]]; then
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/catfile" catfile.c || exit 1
     cp "$out/catfile" "$root/bin/catfile"
     printf 'rootfs motd\n' > "$root/etc/motd"
-    r=$(MYOS_ROOT="$root" "$MYOS" "$out/catfile" /etc/motd 2>/dev/null); rc=$?
+    r=$(PARASYTEOS_ROOT="$root" "$PARASYTEOS" "$out/catfile" /etc/motd 2>/dev/null); rc=$?
     has "rootfs motd" "$r" && [ "$rc" -eq 0 ] && ok "rootfs file is readable through the VFS" \
         || bad "rootfs read: $r (rc=$rc)"
-    r=$(MYOS_ROOT="$root" "$MYOS" "$out/catfile" /etc/none 2>/dev/null); rc=$?
+    r=$(PARASYTEOS_ROOT="$root" "$PARASYTEOS" "$out/catfile" /etc/none 2>/dev/null); rc=$?
     [ "$rc" -eq 1 ] && ok "missing rootfs file reports ENOENT" \
         || bad "rootfs missing: rc=$rc"
-    r=$(printf '/bin/dyn_hello\nexit\n' | MYOS_ROOT="$root" "$MYOS" "$out/sh" 2>/dev/null); rc=$?
+    r=$(printf '/bin/dyn_hello\nexit\n' | PARASYTEOS_ROOT="$root" "$PARASYTEOS" "$out/sh" 2>/dev/null); rc=$?
     has "dyn ok 15" "$r" && has "exited 42" "$r" && ok "shell execs a program by guest path" \
         || bad "rootfs shell exec: $r (rc=$rc)"
 
     # 13. Host-backed descriptors: pipe/fork/dup2/write/read/wait, the
     #     foundation of shell pipelines.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/pipe_test" pipe_test.c || exit 1
-    r=$("$MYOS" "$out/pipe_test" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/pipe_test" 2>/dev/null); rc=$?
     has "parent got: through-the-pipe" "$r" && [ "$rc" -eq 0 ] \
         && ok "pipe + dup2 + fork + wait round-trips" || bad "pipe_test: $r (rc=$rc)"
 
@@ -175,7 +175,7 @@ if [[ -x $MYOS ]]; then
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/catstdin" catstdin.c || exit 1
     cp "$out/catstdin" "$root/bin/catstdin"
     r=$(printf '/bin/dyn_hello | /bin/catstdin\nexit\n' \
-        | MYOS_ROOT="$root" "$MYOS" "$out/sh" 2>/dev/null); rc=$?
+        | PARASYTEOS_ROOT="$root" "$PARASYTEOS" "$out/sh" 2>/dev/null); rc=$?
     has "dyn ok 15" "$r" && [ "$rc" -eq 0 ] \
         && ok "shell pipeline moves bytes through a pipe" || bad "sh pipeline: $r (rc=$rc)"
 
@@ -186,7 +186,7 @@ if [[ -x $MYOS ]]; then
     px() { od -An -tu1 -j $(( 13 + (($2 * 64) + $1) * 3 )) -N 3 "$3" 2>/dev/null \
         | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//'; }
     frame="$out/frame_stack.ppm"
-    MYOS_DISPLAY=64x48 MYOS_FB_OUT="$frame" "$MYOS" "$out/fb_paint" stack >/dev/null 2>&1; rc=$?
+    PARASYTEOS_DISPLAY=64x48 PARASYTEOS_FB_OUT="$frame" "$PARASYTEOS" "$out/fb_paint" stack >/dev/null 2>&1; rc=$?
     if [ "$rc" -eq 0 ] && [ "$(head -c 13 "$frame")" = "$(printf 'P6\n64 48\n255')" ] \
         && [ "$(px 5 5 "$frame")" = "255 0 0" ] \
         && [ "$(px 15 15 "$frame")" = "0 255 0" ] \
@@ -196,7 +196,7 @@ if [[ -x $MYOS ]]; then
         bad "fb_paint stack rc=$rc p(5,5)=$(px 5 5 "$frame") p(15,15)=$(px 15 15 "$frame")"
     fi
     frame="$out/frame_raise.ppm"
-    MYOS_DISPLAY=64x48 MYOS_FB_OUT="$frame" "$MYOS" "$out/fb_paint" raise >/dev/null 2>&1; rc=$?
+    PARASYTEOS_DISPLAY=64x48 PARASYTEOS_FB_OUT="$frame" "$PARASYTEOS" "$out/fb_paint" raise >/dev/null 2>&1; rc=$?
     [ "$rc" -eq 0 ] && [ "$(px 15 15 "$frame")" = "255 0 0" ] \
         && ok "raise puts a window on top" || bad "fb_paint raise rc=$rc p(15,15)=$(px 15 15 "$frame")"
 
@@ -204,7 +204,7 @@ if [[ -x $MYOS ]]; then
     #     (0,0); the window sits at (2,3) on a black buffer. 'H' row 0 is 0x33,
     #     so its leftmost pixel lights (2,3) white while (4,3) stays black.
     frame="$out/frame_text.ppm"
-    MYOS_DISPLAY=64x48 MYOS_FB_OUT="$frame" "$MYOS" "$out/fb_paint" text >/dev/null 2>&1; rc=$?
+    PARASYTEOS_DISPLAY=64x48 PARASYTEOS_FB_OUT="$frame" "$PARASYTEOS" "$out/fb_paint" text >/dev/null 2>&1; rc=$?
     if [ "$rc" -eq 0 ] && [ "$(px 2 3 "$frame")" = "255 255 255" ] \
         && [ "$(px 4 3 "$frame")" = "0 0 0" ] \
         && [ "$(px 50 40 "$frame")" = "16 20 24" ]; then
@@ -219,7 +219,7 @@ if [[ -x $MYOS ]]; then
     #     propagation.
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/selfhost" lib/crt0.S lib/minic.c selfhost.c || exit 1
-    r=$("$MYOS" "$out/selfhost" alpha beta 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/selfhost" alpha beta 2>/dev/null); rc=$?
     if has "selfhost argc=3" "$r" && has "arg[1]=alpha" "$r" && has "arg[2]=beta" "$r" \
         && has "len=63" "$r" && has "fmt=42/ff/ok" "$r" && [ "$rc" -eq 7 ]; then
         ok "self-hosted libc guest runs without host libc"
@@ -239,7 +239,7 @@ if [[ -x $MYOS ]]; then
     #     kernel-side loader must apply the R_X86_64_RELATIVE entries itself.
     "$cc" -nostdlib -static-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/pie_guest" lib/crt0.S lib/minic.c pie_guest.c || exit 1
-    r=$("$MYOS" "$out/pie_guest" hello 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/pie_guest" hello 2>/dev/null); rc=$?
     if has "name[0]=zero" "$r" && has "name[3]=three" "$r" && has "argc=2" "$r" \
         && [ "$rc" -eq 7 ]; then
         ok "static PIE is relocated by the kernel loader"
@@ -265,7 +265,7 @@ if [[ -x $MYOS ]]; then
     #     seccomp filter lets straight through.
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/signal_guest" lib/crt0.S lib/minic.c signal_guest.c || exit 1
-    r=$("$MYOS" "$out/signal_guest" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/signal_guest" 2>/dev/null); rc=$?
     if has "ok handler ran with the right arguments" "$r" \
         && has "ok handler returned through rt_sigreturn" "$r" \
         && has "ok blocked signal stayed pending" "$r" \
@@ -280,7 +280,7 @@ if [[ -x $MYOS ]]; then
     # refused the way a real kernel refuses it.
     "$cc" -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
         -Ilib -O2 -o "$out/no_restorer" lib/crt0.S lib/minic.c no_restorer.c || exit 1
-    r=$("$MYOS" "$out/no_restorer" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/no_restorer" 2>/dev/null); rc=$?
     if has "ok rt_sigaction refused a handler with no restorer" "$r" \
         && has "ok rt_sigaction accepted a handler with one" "$r" && [ "$rc" -eq 0 ]; then
         ok "a handler without a restorer is refused"
@@ -292,7 +292,7 @@ if [[ -x $MYOS ]]; then
     #     timeout (an instant zero strands DNS and every other timed wait),
     #     and ready data returns at once.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/poll_test" poll_test.c || exit 1
-    r=$("$MYOS" "$out/poll_test" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/poll_test" 2>/dev/null); rc=$?
     if has "POLL_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
         ok "poll with a timeout waits for readiness"
     else
@@ -300,11 +300,11 @@ if [[ -x $MYOS ]]; then
     fi
 
     # 21. Guest crypto self-checks: P-256 group order, ECDH consistency,
-    #     and AES-GCM round-trip/tamper, natively and under myos alike.
+    #     and AES-GCM round-trip/tamper, natively and under parasyteos alike.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/ec_test" ec_test.c || exit 1
-    r=$("$MYOS" "$out/ec_test" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/ec_test" 2>/dev/null); rc=$?
     if has "EC_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
-        ok "P-256 + GCM self-checks pass under myos"
+        ok "P-256 + GCM self-checks pass under parasyteos"
     else
         bad "ec_test: rc=$rc out=$r"
     fi
@@ -341,7 +341,7 @@ PYEOF
                 >/dev/null 2>&1 &
             srv=$!
             sleep 2
-            r=$("$MYOS" "$out/fetch" "https://localhost:$1/" 2>/dev/null); rc=$?
+            r=$("$PARASYTEOS" "$out/fetch" "https://localhost:$1/" 2>/dev/null); rc=$?
             kill $srv 2>/dev/null
             [[ "$r" == *"200 OK"* ]] && [ "$rc" -eq 0 ]
         }
@@ -365,39 +365,39 @@ PYEOF
         -o "$out/js" js.c ../third_party/quickjs/quickjs.c \
         ../third_party/quickjs/dtoa.c ../third_party/quickjs/libregexp.c \
         ../third_party/quickjs/libunicode.c ../third_party/quickjs/cutils.c -lm || exit 1
-    r=$("$MYOS" "$out/js" -e '[1,2,3].map(x => x * 2).join("-")' 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/js" -e '[1,2,3].map(x => x * 2).join("-")' 2>/dev/null); rc=$?
     if [ "$r" = "2-4-6" ] && [ "$rc" -eq 0 ]; then
-        ok "QuickJS evaluates closures under myos"
+        ok "QuickJS evaluates closures under parasyteos"
     else
         bad "js eval: rc=$rc out=$r"
     fi
-    r=$("$MYOS" "$out/js" -e 'throw new Error("x")' 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/js" -e 'throw new Error("x")' 2>/dev/null); rc=$?
     [ "$rc" -eq 1 ] && ok "JS exceptions propagate as exit 1" \
         || bad "js throw: rc=$rc out=$r"
 
     # 24. HTML tree: nesting, attributes, void elements, raw script text,
-    #     id lookup and script collection, all under myos.
+    #     id lookup and script collection, all under parasyteos.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/dom_test" dom_test.c lib/dom.c || exit 1
-    r=$("$MYOS" "$out/dom_test" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/dom_test" 2>/dev/null); rc=$?
     if has "DOM_TEST:PASS" "$r" && has "by_id main: div" "$r" && [ "$rc" -eq 0 ]; then
-        ok "HTML parser builds a queryable tree under myos"
+        ok "HTML parser builds a queryable tree under parasyteos"
     else
         bad "dom_test: rc=$rc out=$r"
     fi
 
     # 25. DOM bindings: getElementById, querySelectorAll, createElement,
-    #     timers and the full page flow, all under myos.
+    #     timers and the full page flow, all under parasyteos.
     QJ="../third_party/quickjs/quickjs.c ../third_party/quickjs/dtoa.c ../third_party/quickjs/libregexp.c ../third_party/quickjs/libunicode.c ../third_party/quickjs/cutils.c"
     "$cc" -static -no-pie -O2 -fno-stack-protector '-DCONFIG_VERSION="2026-06-04"' \
         -o "$out/jsdom_test" jsdom_test.c lib/dom.c lib/jsdom.c lib/resolve.c lib/tls.c $QJ -lm || exit 1
-    r=$("$MYOS" "$out/jsdom_test" 2>/dev/null); rc=$?
+    r=$("$PARASYTEOS" "$out/jsdom_test" 2>/dev/null); rc=$?
     if has "JSDOM_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
-        ok "DOM bindings (query/timers/page flow) work under myos"
+        ok "DOM bindings (query/timers/page flow) work under parasyteos"
     else
         bad "jsdom_test: rc=$rc out=$r"
     fi
 else
-    echo "skip myos end-to-end checks ($MYOS not built)"
+    echo "skip parasyteos end-to-end checks ($PARASYTEOS not built)"
 fi
 
 if [[ $fail -eq 0 ]]; then

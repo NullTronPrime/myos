@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
     char req[1024];
     /* HTTP/1.1: some servers (DuckDuckGo's nginx) answer 400 to 1.0. */
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) myos-fetch\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) parasyteos-fetch\r\nConnection: close\r\n\r\n",
              path, host);
     size_t left = strlen(req);
     const char *p = req;

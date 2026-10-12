@@ -1,31 +1,31 @@
-//! `myos`: a kernel that runs as an ordinary Linux process.
+//! `parasyteos`: a kernel that runs as an ordinary Linux process.
 //!
 //! The launcher loads a guest ELF *into its own address space* (no `execve`,
 //! which would discard the `SIGSYS` handler) and jumps to its entry point in a
 //! forked child. Every syscall the guest makes is trapped by a seccomp-bpf
-//! filter, serviced by `oscore`'s pure dispatcher, and returned in `rax`.
+//! filter, serviced by `parasyte_core`'s pure dispatcher, and returned in `rax`.
 //! Nothing is emulated and nothing is booted.
 
-use oscore::elf::ElfImage;
-use osplat::{loader, trap};
+use parasyte_core::elf::ElfImage;
+use parasyte_plat::{loader, trap};
 use std::ffi::CString;
 
 /// Files the guest filesystem starts with.
 const INITRD: &[(&str, &[u8])] = &[
     (
         "/motd",
-        b"myos: parasitic kernel, running inside a process.\n",
+        b"parasyteos: parasitic kernel, running inside a process.\n",
     ),
     ("/version", NAME_VERSION.as_bytes()),
 ];
 
-const NAME_VERSION: &str = concat!("myos ", env!("CARGO_PKG_VERSION"), "\n");
+const NAME_VERSION: &str = concat!("parasyteos ", env!("CARGO_PKG_VERSION"), "\n");
 
 fn usage() -> ! {
     eprintln!(
-        "usage: myos [--allow <nr>]... <program> [args...]\n\n\
-         Runs <program> as a guest under the myos kernel. Every syscall the\n\
-         guest issues is trapped with seccomp-bpf and serviced by oscore.\n\n\
+        "usage: parasyteos [--allow <nr>]... <program> [args...]\n\n\
+         Runs <program> as a guest under the parasyteos kernel. Every syscall the\n\
+         guest issues is trapped with seccomp-bpf and serviced by parasyte_core.\n\n\
          options:\n  \
            --allow <nr>   let guest syscall <nr> reach the host (default: none)\n  \
            --list          print allowed guest syscalls and exit\n  \
@@ -35,7 +35,7 @@ fn usage() -> ! {
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
-    eprintln!("myos: {msg}");
+    eprintln!("parasyteos: {msg}");
     std::process::exit(1);
 }
 
@@ -88,13 +88,13 @@ fn main() {
 
     // An optional host directory backs the guest's `/`. When set, program paths
     // and file opens resolve inside it; the re-exec'd launcher gets the same
-    // root through `MYOS_ROOT` in its environment.
-    let has_root = std::env::var_os("MYOS_ROOT").is_some();
+    // root through `PARASYTEOS_ROOT` in its environment.
+    let has_root = std::env::var_os("PARASYTEOS_ROOT").is_some();
     if has_root {
-        let root = std::path::PathBuf::from(std::env::var_os("MYOS_ROOT").unwrap());
+        let root = std::path::PathBuf::from(std::env::var_os("PARASYTEOS_ROOT").unwrap());
         trap::set_root(root.clone());
         match trap::preload_root(&root) {
-            Ok(n) if !exec_mode => eprintln!("myos: rootfs {} ({n} nodes)", root.display()),
+            Ok(n) if !exec_mode => eprintln!("parasyteos: rootfs {} ({n} nodes)", root.display()),
             Ok(_) => {}
             Err(e) => fail(format_args!("cannot preload rootfs: {e}")),
         }
@@ -111,9 +111,9 @@ fn main() {
     // `DISPLAY`, a refused connection, no socket or a server that never answers,
     // the OS keeps running against its in-memory framebuffer and the guest
     // simply receives no input events.
-    match osplat::display::connect() {
-        Some(()) => eprintln!("myos: display connected"),
-        None => eprintln!("myos: no display server; running headless"),
+    match parasyte_plat::display::connect() {
+        Some(()) => eprintln!("parasyteos: display connected"),
+        None => eprintln!("parasyteos: no display server; running headless"),
     }
 
     // In `--exec` mode the first argument is the guest-visible `argv[0]` and the
@@ -153,7 +153,7 @@ fn main() {
     let envp: Vec<CString> = Vec::new();
 
     let root_path = if has_root {
-        Some(std::path::PathBuf::from(std::env::var_os("MYOS_ROOT").unwrap()))
+        Some(std::path::PathBuf::from(std::env::var_os("PARASYTEOS_ROOT").unwrap()))
     } else {
         None
     };
@@ -164,8 +164,8 @@ fn main() {
 
     if !exec_mode {
         eprintln!(
-            "myos: {} loading {program} at {:#x}",
-            oscore::banner(),
+            "parasyteos: {} loading {program} at {:#x}",
+            parasyte_core::banner(),
             loaded.entry
         );
     }
@@ -179,14 +179,14 @@ fn main() {
             // A filter is already in force; re-arm only the trap handler, which
             // `execve` reset, then hand this process to the new guest.
             if let Err(e) = trap::install_handler_only() {
-                eprintln!("myos: cannot re-arm syscall trap: {e}");
+                eprintln!("parasyteos: cannot re-arm syscall trap: {e}");
                 libc::_exit(120);
             }
-            if let Some(script) = std::env::var_os("MYOS_INJECT") {
+            if let Some(script) = std::env::var_os("PARASYTEOS_INJECT") {
                 match trap::inject_file(std::path::Path::new(&script)) {
-                    Ok(n) => eprintln!("myos: injected {n} input events"),
+                    Ok(n) => eprintln!("parasyteos: injected {n} input events"),
                     Err(e) => {
-                        eprintln!("myos: inject failed: {e}");
+                        eprintln!("parasyteos: inject failed: {e}");
                         libc::_exit(121);
                     }
                 }
@@ -199,7 +199,7 @@ fn main() {
         // applies to.
         //
         // Note: presentation happens inside the child's trap handler when the
-        // guest calls `display_present` (see `osplat::trap`). A compositor
+        // guest calls `display_present` (see `parasyte_plat::trap`). A compositor
         // thread here in the parent would read a *copy* of the kernel state
         // (fork duplicates the process), so it could never see guest windows.
         let pid = libc::fork();
@@ -208,19 +208,19 @@ fn main() {
         }
         if pid == 0 {
             if let Err(e) = trap::install(&allow) {
-                eprintln!("myos: cannot install syscall trap: {e}");
-                eprintln!("myos: this needs Linux with CONFIG_SECCOMP_FILTER.");
+                eprintln!("parasyteos: cannot install syscall trap: {e}");
+                eprintln!("parasyteos: this needs Linux with CONFIG_SECCOMP_FILTER.");
                 libc::_exit(120);
             }
             // Headless interaction tests: queue scripted input before the
             // guest runs. Only the initial guest is injected; `execve`'d
             // children start clean because the re-exec environment does
-            // not propagate `MYOS_INJECT` (see `exec_trampoline`).
-            if let Some(script) = std::env::var_os("MYOS_INJECT") {
+            // not propagate `PARASYTEOS_INJECT` (see `exec_trampoline`).
+            if let Some(script) = std::env::var_os("PARASYTEOS_INJECT") {
                 match trap::inject_file(std::path::Path::new(&script)) {
-                    Ok(n) => eprintln!("myos: injected {n} input events"),
+                    Ok(n) => eprintln!("parasyteos: injected {n} input events"),
                     Err(e) => {
-                        eprintln!("myos: inject failed: {e}");
+                        eprintln!("parasyteos: inject failed: {e}");
                         libc::_exit(121);
                     }
                 }
@@ -238,7 +238,7 @@ fn main() {
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
-            eprintln!("myos: guest killed by signal {sig}");
+            eprintln!("parasyteos: guest killed by signal {sig}");
             std::process::exit(128 + sig);
         }
         std::process::exit(1);

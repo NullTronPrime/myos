@@ -1,4 +1,4 @@
-// Paints a couple of overlapping windows through the myos display syscalls and
+// Paints a couple of overlapping windows through the parasyteos display syscalls and
 // asks the host to composite them. The host writes the frame as a PPM, which is
 // how the offscreen display becomes observable in tests.
 //

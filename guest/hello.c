@@ -1,15 +1,15 @@
 /* A guest built on minic, our self-hosted C library: no host libc and no
- * dynamic linker. Every syscall it makes is trapped by myos and serviced by
- * oscore. The writes to fd 1 are captured by the dispatcher and flushed to the
+ * dynamic linker. Every syscall it makes is trapped by parasyteos and serviced by
+ * parasyte_core. The writes to fd 1 are captured by the dispatcher and flushed to the
  * terminal by the SIGSYS handler, which proves the trap-service path end to
  * end. The open/read/close sequence exercises the in-memory VFS. */
 #include "minic.h"
 
 int main(void) {
-    static const char hello[] = "guest: write trapped and serviced by myos\n";
+    static const char hello[] = "guest: write trapped and serviced by parasyteos\n";
     write(1, hello, sizeof(hello) - 1);
 
-    /* open/read/close against the seeded /motd file in myos's VFS. */
+    /* open/read/close against the seeded /motd file in parasyteos's VFS. */
     char buf[128];
     int fd = open("/motd", O_RDONLY);
     if (fd >= 0) {

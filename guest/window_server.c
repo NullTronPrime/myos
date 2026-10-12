@@ -64,12 +64,12 @@ struct client {
 static struct client clients[MAX_CLIENTS];
 static int client_count = 0;
 
-// Input event kinds, matching oscore::input::EventKind codes.
+// Input event kinds, matching parasyte_core::input::EventKind codes.
 #define EV_EXPOSE 7
 #define EV_CLOSE 8
 #define EV_RESIZE 9
 
-// Well-known rendezvous, mirroring oscore::winserv paths.
+// Well-known rendezvous, mirroring parasyte_core::winserv paths.
 #define WINSERV_DIR "/winserv"
 #define WINSERV_CLIENTS "/winserv/clients"
 #define WINSERV_PIDFILE "/winserv/server.pid"
