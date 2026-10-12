@@ -58,6 +58,9 @@ int dom_by_tag(struct dom_doc *doc, const char *tag, struct dom_node **out, int 
 /* Attribute value or NULL. */
 const char *dom_attr(const struct dom_node *n, const char *name);
 
+/* Sets (replacing or adding) an attribute. */
+void dom_set_attr(struct dom_node *n, const char *name, const char *value);
+
 /* Appends an existing node as a child (reparents). */
 void dom_append(struct dom_node *parent, struct dom_node *child);
 

@@ -873,6 +873,46 @@ static JSValue doc_body(JSContext *ctx, JSValueConst self, int argc, JSValueCons
     return mk_element(ctx, find_body(pg->doc));
 }
 
+static JSValue doc_first_tag(JSContext *ctx, const char *tag) {
+    struct jsdom_page *pg = cur_page(ctx);
+    if (!pg) return JS_NULL;
+    struct dom_node *found[1] = {0};
+    int nfound = 0;
+    const char *parts[1] = {tag};
+    qs_walk(pg->doc->root, parts, 1, found, 1, &nfound, 1);
+    return nfound ? mk_element(ctx, found[0]) : JS_NULL;
+}
+
+static JSValue doc_element(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)argc;
+    (void)argv;
+    (void)self;
+    return doc_first_tag(ctx, "html");
+}
+
+static JSValue doc_head(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)argc;
+    (void)argv;
+    (void)self;
+    return doc_first_tag(ctx, "head");
+}
+
+static JSValue doc_add_listener(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self;
+    struct jsdom_page *pg = cur_page(ctx);
+    if (argc < 2 || !pg) return JS_UNDEFINED;
+    const char *type = JS_ToCString(ctx, argv[0]);
+    if (type && JS_IsFunction(ctx, argv[1]) && pg->nlisteners < JSDOM_MAX_LISTENERS) {
+        pg->listeners[pg->nlisteners].node = NULL;
+        snprintf(pg->listeners[pg->nlisteners].type,
+                 sizeof(pg->listeners[0].type), "%.15s", type);
+        pg->listeners[pg->nlisteners].fn = JS_DupValue(ctx, argv[1]);
+        pg->nlisteners++;
+    }
+    JS_FreeCString(ctx, type);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_console_log(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)self;
     for (int i = 0; i < argc; i++) {
@@ -966,8 +1006,22 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
     set_fn(ctx, document, "createElement", doc_create, 1);
     set_fn(ctx, document, "write", doc_write, 1);
     set_fn(ctx, document, "writeln", doc_write, 1);
+    set_fn(ctx, document, "addEventListener", doc_add_listener, 2);
+    {
+        /* String-valued properties pages sniff before use. */
+        JSValue c = JS_NewString(ctx, "");
+        JS_SetPropertyStr(ctx, document, "cookie", c);
+        JSValue rs = JS_NewString(ctx, "complete");
+        JS_SetPropertyStr(ctx, document, "readyState", rs);
+        JSValue curl = JS_NewString(ctx, pg->url);
+        JS_SetPropertyStr(ctx, document, "URL", curl);
+        JSValue ref = JS_NewString(ctx, "");
+        JS_SetPropertyStr(ctx, document, "referrer", ref);
+    }
     set_getset(ctx, document, "title", doc_title, NULL);
     set_getset(ctx, document, "body", doc_body, NULL);
+    set_getset(ctx, document, "documentElement", doc_element, NULL);
+    set_getset(ctx, document, "head", doc_head, NULL);
     JS_SetPropertyStr(ctx, global, "document", document);
 
     /* window bits live on the global object. */
@@ -975,6 +1029,7 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
     set_fn(ctx, global, "clearTimeout", win_clear, 1);
     set_fn(ctx, global, "setInterval", win_set_interval, 2);
     set_fn(ctx, global, "clearInterval", win_clear, 1);
+    set_fn(ctx, global, "addEventListener", doc_add_listener, 2);
     {
         JSValue loc = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, loc, "href", JS_NewString(ctx, pg->url));
@@ -982,7 +1037,19 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
         JSValue nav = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, nav, "userAgent",
                           JS_NewString(ctx, "myos-jsdom/1.0"));
+        JS_SetPropertyStr(ctx, nav, "language", JS_NewString(ctx, "en-US"));
+        JS_SetPropertyStr(ctx, nav, "platform", JS_NewString(ctx, "Linux x86_64"));
+        JSValue langs = JS_NewArray(ctx);
+        JS_SetPropertyUint32(ctx, langs, 0, JS_NewString(ctx, "en-US"));
+        JS_SetPropertyStr(ctx, nav, "languages", langs);
         JS_SetPropertyStr(ctx, global, "navigator", nav);
+        JSValue scr = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, scr, "width", JS_NewInt32(ctx, 1280));
+        JS_SetPropertyStr(ctx, scr, "height", JS_NewInt32(ctx, 800));
+        JS_SetPropertyStr(ctx, global, "screen", scr);
+        JS_SetPropertyStr(ctx, global, "innerWidth", JS_NewInt32(ctx, 640));
+        JS_SetPropertyStr(ctx, global, "innerHeight", JS_NewInt32(ctx, 480));
+        JS_SetPropertyStr(ctx, global, "devicePixelRatio", JS_NewInt32(ctx, 1));
         JSValue console = JS_NewObject(ctx);
         set_fn(ctx, console, "log", js_console_log, 1);
         JS_SetPropertyStr(ctx, global, "console", console);
@@ -996,16 +1063,21 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
         for (int i = 0; i < ns; i++) {
             JSValue v = JS_Eval(ctx, ss[i], strlen(ss[i]), "<script>", JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(v)) {
-                /* One bad script must not kill the rest: report the
-                 * first failure and carry on (browsers do the same). */
-                if (!err[0]) {
+                /* One bad script must not kill the rest: report each
+                 * failure (browsers log them all) and carry on. */
+                {
                     JSValue ex = JS_GetException(ctx);
                     const char *s = JS_ToCString(ctx, ex);
-                    snprintf(err, errcap, "%.100s", s ? s : "script error");
+                    JSValue st = JS_GetPropertyStr(ctx, ex, "stack");
+                    const char *stack = NULL;
+                    if (!JS_IsUndefined(st)) stack = JS_ToCString(ctx, st);
+                    fprintf(stderr, "browser: js script %d: %.80s || %.120s\n", i,
+                            s ? s : "script error", stack ? stack : "");
+                    if (!err[0])
+                        snprintf(err, errcap, "%.100s", s ? s : "script error");
                     JS_FreeCString(ctx, s);
-                    JS_FreeValue(ctx, ex);
-                } else {
-                    JSValue ex = JS_GetException(ctx);
+                    if (stack) JS_FreeCString(ctx, stack);
+                    JS_FreeValue(ctx, st);
                     JS_FreeValue(ctx, ex);
                 }
                 JS_FreeValue(ctx, v);

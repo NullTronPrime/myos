@@ -101,6 +101,7 @@ struct input_event {
 /* Keysyms. */
 #define KEY_RETURN 0xff0d
 #define KEY_BS 0xff08
+#define KEY_ESC 0xff1b
 #define KEY_PRIOR 0xff55
 #define KEY_NEXT 0xff54
 #define KEY_UP 0xff51 /* host aliases Up and Down to one keysym */
@@ -123,6 +124,7 @@ struct line {
 struct link {
     int row, c0, c1; /* row and half-open column range in page coords */
     char url[URL_CAP];
+    struct dom_node *field; /* non-NULL for form-field clicks (no navigate) */
 };
 
 static int win = -1;
@@ -422,6 +424,9 @@ static size_t walk_len = 0;
 static struct dom_doc *page_doc = NULL;
 static struct jsdom_page *page_js = NULL;
 static void relayout(void);
+static void submit_form(struct dom_node *from);
+/* Focused form field (a dom node), or NULL for the URL bar. */
+static struct dom_node *focused_input = NULL;
 
 #define WFLUSH() do { \
         if (walk_len > 0 && ntoks < 4096) { \
@@ -501,10 +506,49 @@ static void walk_node(struct dom_node *n) {
             walk_link = nlinks;
             snprintf(links[nlinks].url, sizeof(links[nlinks].url), "%s", href);
             links[nlinks].row = -1;
+            links[nlinks].field = NULL;
             nlinks++;
         }
         for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
         walk_link = save;
+        return;
+    }
+    if (n->tag == TAG_IMG) {
+        /* Images have no pixels here; their alt text reads in place. */
+        const char *alt = dom_attr(n, "alt");
+        if (alt && alt[0]) walk_text(alt);
+        return;
+    }
+    if (n->tag == TAG_INPUT) {
+        const char *type = dom_attr(n, "type");
+        int is_button = type && (strcasecmp(type, "submit") == 0 ||
+                                 strcasecmp(type, "button") == 0);
+        int is_text = !type || strcasecmp(type, "text") == 0 ||
+                      strcasecmp(type, "search") == 0;
+        if (!is_button && !is_text) return; /* hidden/checkbox/radio */
+        int save = walk_link;
+        if (nlinks < MAX_LINKS) {
+            char cell[64];
+            if (is_button) {
+                /* Submit button: its label clicks. */
+                const char *v = dom_attr(n, "value");
+                snprintf(cell, sizeof(cell), "[ %s ]", v && v[0] ? v : "submit");
+            } else {
+                const char *v = dom_attr(n, "value");
+                if (!v) v = "";
+                if (n == focused_input)
+                    snprintf(cell, sizeof(cell), "[ %-27.27s_]", v);
+                else
+                    snprintf(cell, sizeof(cell), "[ %-28.28s]", v);
+            }
+            walk_link = nlinks;
+            links[nlinks].url[0] = '\0';
+            links[nlinks].row = -1;
+            links[nlinks].field = n;
+            nlinks++;
+            walk_text(cell);
+            walk_link = save;
+        }
         return;
     }
     if (walk_block_tag(n->tag)) WNEWLINE();
@@ -529,6 +573,7 @@ static void layout_html(const char *html) {
     ntoks = 0;
     walk_len = 0;
     walk_link = -1;
+    focused_input = NULL; /* old tree is freed below; never dangle */
 
     /* Parse once; scripts run against this tree before layout. */
     if (page_doc) {
@@ -1169,11 +1214,30 @@ static void click_page(int px, int py) {
     int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
     int r = (py - CHROME_H) / CHAR_H;
     int c = px / CHAR_W;
+    fprintf(stderr, "browser: click x=%d y=%d r=%d c=%d nlinks=%d nlines=%d\n", px, py, r, c,
+            nlinks, nlines);
+    for (int k = 0; k < nlinks; k++)
+        fprintf(stderr, "browser: link %d row=%d c0=%d c1=%d field=%p url=%.20s\n", k,
+                links[k].row, links[k].c0, links[k].c1, (void *)links[k].field,
+                links[k].url);
     if (r < 0 || r >= rows) return;
     int lr = scroll + r;
     if (lr < 0 || lr >= nlines) return;
     for (int k = 0; k < nlinks; k++) {
         if (links[k].row == lr && c >= links[k].c0 && c < links[k].c1) {
+            if (links[k].field) {
+                /* Form field: text focuses, submit clicks through. */
+                const char *type = dom_attr(links[k].field, "type");
+                if (type && (strcasecmp(type, "submit") == 0 ||
+                             strcasecmp(type, "button") == 0)) {
+                    submit_form(links[k].field);
+                } else {
+                    focused_input = links[k].field;
+                    relayout();
+                    present();
+                }
+                return;
+            }
             char target[URL_CAP];
             char base[URL_CAP];
             snprintf(base, sizeof(base), "%s", urlbar);
@@ -1183,6 +1247,65 @@ static void click_page(int px, int py) {
             return;
         }
     }
+}
+
+/* Submits the form enclosing a node (GET): action + named inputs. */
+static void submit_form(struct dom_node *from) {
+    struct dom_node *f = from;
+    while (f && f->tag != TAG_FORM) f = f->parent;
+    char action[URL_CAP] = {0};
+    if (f) {
+        const char *a = dom_attr(f, "action");
+        if (a) snprintf(action, sizeof(action), "%s", a);
+    }
+    if (!action[0]) snprintf(action, sizeof(action), "%s", urlbar);
+    /* Collect name=value pairs under the form (or the whole page). */
+    static char query[2048];
+    query[0] = '\0';
+    struct dom_node *scope = f ? f : (page_doc ? page_doc->root : NULL);
+    if (scope) {
+        struct dom_node *stack[256];
+        int sp = 0;
+        stack[sp++] = scope;
+        while (sp > 0) {
+            struct dom_node *n = stack[--sp];
+            if (n->tag == TAG_INPUT) {
+                const char *type = dom_attr(n, "type");
+                int is_button = type && (strcasecmp(type, "submit") == 0 ||
+                                         strcasecmp(type, "button") == 0);
+                const char *nm = dom_attr(n, "name");
+                if (!is_button && nm && nm[0]) {
+                    const char *v = dom_attr(n, "value");
+                    if (!v) v = "";
+                    char pair[512];
+                    size_t pi = 0;
+                    pi += (size_t)snprintf(pair + pi, sizeof(pair) - pi, "%s%s=",
+                                           query[0] ? "&" : "", nm);
+                    for (const char *s = v; *s && pi + 1 < sizeof(pair); s++)
+                        pair[pi++] = *s == ' ' ? '+' : *s;
+                    pair[pi] = '\0';
+                    if (strlen(query) + strlen(pair) < sizeof(query) - 1)
+                        strcat(query, pair);
+                }
+            }
+            for (int i = n->nkids - 1; i >= 0; i--) {
+                if (sp < 256) stack[sp++] = n->kids[i];
+            }
+        }
+    }
+    char target[URL_CAP];
+    {
+        char base[URL_CAP];
+        snprintf(base, sizeof(base), "%s", urlbar);
+        char merged[URL_CAP * 2];
+        snprintf(merged, sizeof(merged), "%s%s%s", action,
+                 query[0] ? (strchr(action, '?') ? "&" : "?") : "", query);
+        merged[sizeof(merged) - 1] = '\0';
+        resolve_url(base, merged, target, sizeof(target));
+    }
+    focused_input = NULL;
+    navigate(target, 1);
+    present();
 }
 
 static void push_fwd(const char *url) {
@@ -1409,6 +1532,43 @@ int main(int argc, char **argv) {
             }
             if (ev.kind != EV_KEYDOWN) continue;
             long k = ev.x;
+            if (focused_input) {
+                /* Typing goes to the focused form field. */
+                if ((ev.mods & MOD_CTRL) && (k == 'u' || k == 'U')) {
+                    dom_set_attr(focused_input, "value", "");
+                    relayout();
+                    present();
+                    continue;
+                }
+                if (k == KEY_RETURN) {
+                    submit_form(focused_input);
+                } else if (k == KEY_BS) {
+                    const char *v = dom_attr(focused_input, "value");
+                    if (v && v[0]) {
+                        char nb[256];
+                        snprintf(nb, sizeof(nb), "%s", v);
+                        nb[strlen(nb) - 1] = '\0';
+                        dom_set_attr(focused_input, "value", nb);
+                        relayout();
+                        present();
+                    }
+                } else if (k == KEY_ESC) {
+                    focused_input = NULL;
+                    relayout();
+                    present();
+                } else if (k >= 0x20 && k < 0x7f && !(ev.mods & ~1)) {
+                    const char *v = dom_attr(focused_input, "value");
+                    if (!v) v = "";
+                    if (strlen(v) < 200) {
+                        char nb[256];
+                        snprintf(nb, sizeof(nb), "%s%c", v, (char)k);
+                        dom_set_attr(focused_input, "value", nb);
+                        relayout();
+                        present();
+                    }
+                }
+                continue;
+            }
             /* Ctrl+U clears the URL bar (readline-style), so a search can
              * start from a known state without re-launching. */
             if ((ev.mods & MOD_CTRL) && (k == 'u' || k == 'U')) {

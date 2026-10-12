@@ -102,6 +102,35 @@ const char *dom_attr(const struct dom_node *n, const char *name) {
     return NULL;
 }
 
+/* Sets (replacing or adding) an attribute. Used for live input values. */
+void dom_set_attr(struct dom_node *n, const char *name, const char *value) {
+    if (!n || !name || !value) return;
+    for (int i = 0; i < n->nattrs; i++) {
+        if (strcasecmp(n->attrs[i].name, name) == 0) {
+            char *nv = malloc(strlen(value) + 1);
+            if (nv) {
+                strcpy(nv, value);
+                free(n->attrs[i].value);
+                n->attrs[i].value = nv;
+            }
+            return;
+        }
+    }
+    struct dom_attr *na = realloc(n->attrs, sizeof(*na) * (size_t)(n->nattrs + 1));
+    if (!na) return;
+    n->attrs = na;
+    n->attrs[n->nattrs].name = malloc(strlen(name) + 1);
+    n->attrs[n->nattrs].value = malloc(strlen(value) + 1);
+    if (n->attrs[n->nattrs].name && n->attrs[n->nattrs].value) {
+        strcpy(n->attrs[n->nattrs].name, name);
+        strcpy(n->attrs[n->nattrs].value, value);
+        n->nattrs++;
+    } else {
+        free(n->attrs[n->nattrs].name);
+        free(n->attrs[n->nattrs].value);
+    }
+}
+
 static void by_id_walk(struct dom_node *n, const char *id, struct dom_node **hit) {
     if (*hit || !n) return;
     const char *v = dom_attr(n, "id");
