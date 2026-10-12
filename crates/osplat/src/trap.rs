@@ -37,7 +37,7 @@ use oscore::syscall::{
     PROT_READ, PROT_WRITE, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_CONNECT,
     SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETDENTS,
     SYS_GETPEERNAME, SYS_GETPGID, SYS_GETPGRP, SYS_GETPID, SYS_GETSID, SYS_GETSOCKNAME,
-    SYS_GETSOCKOPT, SYS_IOCTL, SYS_KILL, SYS_LISTEN, SYS_OPEN, SYS_OPENAT, SYS_PIPE, SYS_PIPE2,
+    SYS_GETSOCKOPT, SYS_IOCTL, SYS_KILL, SYS_LISTEN,     SYS_DISPLAY_XID, SYS_OPEN, SYS_OPENAT, SYS_PIPE, SYS_PIPE2, SYS_POLL, SYS_WINDOW_MOVE,
     SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RT_SIGRETURN, SYS_SENDMSG, SYS_SENDTO, SYS_SETPGID,
     SYS_SETSID, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SYNC_FS,
     SYS_UNLINK, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE,
@@ -346,6 +346,120 @@ fn wait_for_input(deadline_ns: u64) {
             tv_nsec: (chunk % 1_000_000_000) as i64,
         };
         unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut()) };
+    }
+}
+
+/// Waits for a `poll` set to become ready, honouring the guest's timeout.
+///
+/// The dispatcher is synchronous, so it can only snapshot readiness: a call
+/// with nothing ready *yet* reports zero even when data arrives a millisecond
+/// later, which stranded every DNS lookup (UDP and TCP alike). The real wait
+/// happens here on the host: block in `poll(2)` over the host-backed subset,
+/// pump input between chunks so the UI stays alive, and wake early if input
+/// the guest also watches arrives. Returns true when something is (probably)
+/// ready; the caller then rewinds so the guest re-runs the call and the
+/// dispatcher takes a fresh snapshot. A timed-out wait returns false and the
+/// dispatcher's zero stands, which keeps one guest wait to one host wait.
+fn poll_wait_for_ready(fds_ptr: u64, nfds: usize, timeout_ms: i32) -> bool {
+    const POLLFD_SIZE: usize = 8;
+    const POLLIN: u16 = 0x001;
+    if nfds == 0 {
+        // Nothing to wait on: `poll` with no fds is a sleep.
+        if timeout_ms > 0 {
+            let now = host_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64;
+            sleep_until(now + timeout_ms as u64 * 1_000_000);
+        }
+        return false;
+    }
+    if nfds > 1024 {
+        return false;
+    }
+    let raw = match unsafe { regs::read_guest(fds_ptr, nfds * POLLFD_SIZE) } {
+        Some(b) => b,
+        None => return false,
+    };
+    // Map the guest set onto host fds; note whether the guest also watches
+    // its input queue so input arrival wakes the wait too.
+    let mut host: Vec<libc::pollfd> = Vec::new();
+    let mut watches_input = false;
+    {
+        let g = state().lock().unwrap_or_else(|p| p.into_inner());
+        for i in 0..nfds {
+            let off = i * POLLFD_SIZE;
+            let fd = i32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+            let events = u16::from_le_bytes(raw[off + 4..off + 6].try_into().unwrap());
+            if events == 0 {
+                continue;
+            }
+            match g.fds.get(Fd(fd as u32)) {
+                Ok(FdKind::Host(h)) => host.push(libc::pollfd {
+                    fd: h,
+                    events: events as i16,
+                    revents: 0,
+                }),
+                Ok(FdKind::Input) => {
+                    if events & POLLIN != 0 {
+                        watches_input = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let infinite = timeout_ms < 0;
+    let deadline = if infinite {
+        u64::MAX
+    } else {
+        host_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64 + timeout_ms as u64 * 1_000_000
+    };
+    loop {
+        let now = host_clock_ns(libc::CLOCK_MONOTONIC).max(0) as u64;
+        if !infinite && now >= deadline {
+            return false;
+        }
+        let chunk_ms: i32 = if infinite {
+            25
+        } else {
+            ((deadline - now) / 1_000_000).min(25).max(1) as i32
+        };
+        if !host.is_empty() {
+            for pfd in host.iter_mut() {
+                pfd.revents = 0;
+            }
+            let rc =
+                unsafe { libc::poll(host.as_mut_ptr(), host.len() as libc::nfds_t, chunk_ms) };
+            if rc > 0 {
+                return true;
+            }
+            if rc < 0 && last_errno() as libc::c_int != libc::EINTR {
+                return false;
+            }
+        } else {
+            // No host fds: nap so input can arrive, then re-check below.
+            let chunk_ns = chunk_ms as u64 * 1_000_000;
+            let ts = libc::timespec {
+                tv_sec: (chunk_ns / 1_000_000_000) as libc::time_t,
+                tv_nsec: (chunk_ns % 1_000_000_000) as libc::c_long,
+            };
+            unsafe {
+                libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut())
+            };
+        }
+        pump_input();
+        if watches_input {
+            let have = match state().lock() {
+                Ok(g) => !g.input.is_empty(),
+                Err(p) => !p.into_inner().input.is_empty(),
+            };
+            if have {
+                return true;
+            }
+        }
+        // An infinite wait with nothing host-side or input-side to watch can
+        // never wake; bail instead of hanging the emulator.
+        if infinite && host.is_empty() && !watches_input {
+            return false;
+        }
     }
 }
 
@@ -1044,6 +1158,11 @@ pub fn shm_unlink(name: &str) {
 ///   guest VFS carries no host network configuration);
 /// - `/dev/urandom` and `/dev/random` (read-only entropy for TLS and key
 ///   generation; writes are rejected with `EPERM`);
+/// - `/dev/audio` (write-only: raw unsigned 8-bit mono PCM at 8000 Hz.
+///   Writes stream to the host's `paplay` (PulseAudio); the format is
+///   intentionally fixed — this is an 8-bit minimalist sound card, not a
+///   mixer. Reads are rejected. Set `MYOS_AUDIO_CMD` to redirect playback,
+///   e.g. `tee /tmp/cap.u8`, for testing without speakers);
 /// - `/winserv` and everything under it (the window-server rendezvous:
 ///   client registrations and the server pid file). This is the one
 ///   host-backed shared namespace: every guest process sees the same
@@ -1051,6 +1170,38 @@ pub fn shm_unlink(name: &str) {
 ///   clients living in others. Requires a configured rootfs; without one
 ///   the paths stay VFS-local. Parent directories are created on demand.
 ///
+/// Spawns the host audio player for `/dev/audio` and returns the write end
+/// of its stdin as a host fd. Guest bytes are unsigned 8-bit mono PCM at
+/// 8000 Hz; the player (`paplay` over PulseAudio by default) drains the
+/// pipe at its own pace, so a writing guest blocks with natural
+/// sound-card backpressure. Closing the fd sends EOF and the player exits;
+/// a detached thread reaps it so no zombie lingers.
+///
+/// `MYOS_AUDIO_CMD` overrides the player (whitespace-split, no quoting):
+/// `MYOS_AUDIO_CMD="tee /tmp/cap.u8"` captures guest audio to a file for
+/// testing on a headless box.
+fn audio_open() -> Result<i32, i32> {
+    use std::os::unix::io::IntoRawFd;
+    use std::process::{Command, Stdio};
+    let cmdline = std::env::var("MYOS_AUDIO_CMD").unwrap_or_else(|_| {
+        "paplay --raw --rate=8000 --channels=1 --format=u8".to_string()
+    });
+    let mut words = cmdline.split_whitespace();
+    let prog = words.next().unwrap_or("paplay");
+    let mut child = Command::new(prog)
+        .args(words)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| libc::ENODEV)?;
+    let stdin = child.stdin.take().ok_or(libc::ENODEV)?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(stdin.into_raw_fd())
+}
+
 /// Everything else belongs to the guest VFS.
 fn host_bridge_open(path: &[u8], flags: i32, mode: u32) -> Option<Result<i32, i64>> {
     // Guest flag bits match Linux `O_*`; carry blocking mode across and
@@ -1087,6 +1238,12 @@ fn host_bridge_open(path: &[u8], flags: i32, mode: u32) -> Option<Result<i32, i6
         if flags & libc::O_CLOEXEC != 0 {
             oflags |= libc::O_CLOEXEC;
         }
+    } else if path == b"/dev/audio" {
+        // 8-bit sound out: anything but write access makes no sense.
+        if flags & 0o3 == libc::O_RDONLY {
+            return Some(Err(libc::EACCES as i64));
+        }
+        return Some(audio_open().map_err(|e| e as i64));
     } else if path == b"/winserv" || path.starts_with(b"/winserv/") {
         use std::os::unix::ffi::OsStrExt;
         let host = winserv_host_path(path)?;
@@ -1142,9 +1299,9 @@ fn host_bridge_open(path: &[u8], flags: i32, mode: u32) -> Option<Result<i32, i6
 /// the path is outside the namespace or no rootfs is configured.
 ///
 /// Bridged: the directory itself, `server.pid`, the `clients` directory,
-/// and `clients/<pid>`. Anything else (deeper paths, `..`) stays in the
-/// guest VFS, so a guest cannot use this hole to reach the rest of the
-/// rootfs.
+/// `clients/<pid>`, and the `desktop` directory with its `xid` rendezvous
+/// file. Anything else (deeper paths, `..`) stays in the guest VFS, so a
+/// guest cannot use this hole to reach the rest of the rootfs.
 fn winserv_host_path(path: &[u8]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let root = root()?;
@@ -1154,8 +1311,13 @@ fn winserv_host_path(path: &[u8]) -> Option<PathBuf> {
         return Some(base);
     }
     let rel = path.strip_prefix(b"/winserv/")?;
-    if rel == b"server.pid" || rel == b"clients" {
+    if rel == b"server.pid" || rel == b"clients" || rel == b"desktop" {
         base.push(std::ffi::OsStr::from_bytes(rel));
+        return Some(base);
+    }
+    if rel == b"desktop/xid" {
+        base.push("desktop");
+        base.push("xid");
         return Some(base);
     }
     let name = rel.strip_prefix(b"clients/")?;
@@ -1425,7 +1587,10 @@ fn exec_trampoline(guest: &[u8], host: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]
             env_owned.push(e);
         }
     }
-    for key in ["MYOS_DISPLAY", "MYOS_FB_OUT"] {
+    // DISPLAY too: without it the child cannot find the X socket and
+    // every GUI app launched from the desktop runs headless (its window
+    // never reaches the compositor).
+    for key in ["DISPLAY", "MYOS_DISPLAY", "MYOS_FB_OUT"] {
         if let Ok(v) = std::env::var(key) {
             if let Ok(e) = CString::new(format!("{key}={v}")) {
                 env_owned.push(e);
@@ -1665,6 +1830,22 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
         SYS_GETPGRP => {
             regs::set_return(uc, unsafe { libc::getpgrp() } as i64);
             true
+        }
+        SYS_DISPLAY_XID => {
+            match crate::display::xid() {
+                Some(x) => regs::set_return(uc, x as i64),
+                None => regs::set_return(uc, -(libc::ENODEV as i64)),
+            }
+            true
+        }
+        SYS_WINDOW_MOVE => {
+            // An embedded client drags its outer host window with this
+            // call; the dispatcher below still updates the guest-side
+            // model, so this arm never claims the syscall.
+            if std::env::var_os("MYOS_EMBED_PARENT").is_some() {
+                crate::display::move_outer(regs_in.arg(1) as i32, regs_in.arg(2) as i32);
+            }
+            false
         }
         SYS_SETPGID | SYS_GETPGID | SYS_GETSID => {
             let pid = regs_in.arg(0) as i32;
@@ -2675,6 +2856,26 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
         )
     };
 
+    // `poll` with a nonzero timeout waits for readiness; the dispatcher only
+    // takes an instant snapshot, so a zero from it means "nothing yet" rather
+    // than "nothing within the timeout". Wait on the host, then rewind so the
+    // guest re-runs the call against fresh state. A timed-out wait keeps the
+    // zero (waiting twice would double every timeout).
+    //
+    // Every rewind records the syscall number: the result is written to
+    // `rax` below, and a rewound call re-executes whatever number `rax`
+    // holds — without this the guest would re-run syscall 0 (`read`).
+    let mut rewound_nr: Option<i64> = None;
+    if regs_in.nr == SYS_POLL && matches!(result, Ok(0)) {
+        let timeout_ms = regs_in.arg(2) as i32;
+        if timeout_ms != 0
+            && poll_wait_for_ready(regs_in.arg(0), regs_in.arg(1) as usize, timeout_ms)
+        {
+            rewind(&mut *uc);
+            rewound_nr = Some(regs_in.nr);
+        }
+    }
+
     trace(regs_in.nr, regs_in.arg(0), regs_in.rip, result);
 
     // A guest that asked to sleep is served here rather than in the dispatcher,
@@ -2694,6 +2895,7 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
             // wrote; this is what makes `input_wait` a wait rather than a poll
             // that always says "nothing yet".
             rewind(&mut *uc);
+            rewound_nr = Some(regs_in.nr);
         }
         clear_sleep();
     }
@@ -2762,6 +2964,14 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, uc: *mut c_void)
     // `syscall` instruction, so only `rax` needs writing; touching `rip` would
     // resume in the middle of the next instruction.
     regs::set_return(uc, ret);
+    // A rewound call re-executes the instruction at the stepped-back `rip`,
+    // and the kernel takes the number to run from `rax` — which now holds
+    // the abandoned attempt's result. Restore the number last, so the guest
+    // re-runs its own call. (Without this, every waited-on poll resumed as
+    // syscall 0 (`read`) and died with a mystifying EBADF.)
+    if let Some(nr) = rewound_nr {
+        regs::set_nr(&mut *uc, nr);
+    }
 
     // A signal raised by this syscall, or left over from a fault, is delivered
     // now that the guest is at a syscall boundary — the one place it can be

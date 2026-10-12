@@ -1,20 +1,24 @@
-/* tls: minimal TLS 1.2 client (TLS_RSA_WITH_AES_128_CBC_SHA).
+/* tls: minimal TLS 1.2 client (ECDHE+RSA+GCM preferred, RSA+CBC fallback).
  *
  * Accounting of every cryptographic choice, so nobody mistakes this for a
  * general TLS stack:
  *
- * - One cipher suite only. Servers that do not offer RSA+AES128-CBC+SHA
- *   fail the handshake; that is reported, not negotiated around.
+ * - Two suites: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (P-256, offered
+ *   first) and TLS_RSA_WITH_AES_128_CBC_SHA (fallback). Servers offering
+ *   neither fail the handshake; that is reported, not negotiated around.
+ * - RSA certificates only: a server sending an ECDSA chain fails, and only
+ *   rsa_pkcs1_sha256 signatures are offered/verified (servers that ignore
+ *   signature_algorithms and sign with another hash fail too).
  * - Server authentication is hostname (+expiry sanity), not chain trust:
  *   there is no trust-anchor store in the guest yet, so a self-signed cert
  *   for the right name is accepted with a note. MITM by a wrong-host cert
- *   is rejected (CN/SAN must match).
+ *   is rejected (CN/SAN must match). Server ECDHE points are validated
+ *   on-curve before use.
  * - No session resumption, no renegotiation (a HelloRequest kills the
  *   connection), no compression, no TLS 1.3, TLS 1.2 record framing only.
- * - RSA public operations only (encrypt with e=65537-sized exponents);
- *   bignum code is schoolbook multiply + binary modulus, constant in shape
- *   but not hardened against side channels. Fine for a demo OS, not for
- *   secrets that matter.
+ * - Schoolbook bignum + affine P-256, constant in shape but not hardened
+ *   against side channels. Fine for a demo OS, not for secrets that
+ *   matter.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -31,6 +35,7 @@
 #define TLS_VER_MAJOR 3
 #define TLS_VER_MINOR 3 /* 3.3 on the wire == TLS 1.2 */
 #define SUITE_RSA_AES128_SHA 0x002f
+#define SUITE_ECDHE_RSA_AES128_GCM 0xc02f
 #define REC_MAX 16384
 #define TRANS_MAX 16384
 #define CERT_MAX 8192
@@ -729,6 +734,210 @@ static void bn_to_bytes(const struct bn *a, unsigned char *out, size_t n) {
     }
 }
 
+/* ---------------- P-256 (ECDHE) ----------------
+ *
+ * Affine-coordinate arithmetic over struct bn, reusing the generic
+ * addmod/mulmod. Slow (~0.2s a handshake) but obviously correct; a toy
+ * client pays that once per connection. Server points are validated
+ * on-curve before use.
+ */
+
+static const unsigned char P256_P[32] = {
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
+static const unsigned char P256_N[32] = {
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+    0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51
+};
+static const unsigned char P256_B[32] = {
+    0x5a, 0xc6, 0x35, 0xd8, 0xaa, 0x3a, 0x93, 0xe7, 0xb3, 0xeb, 0xbd, 0x55,
+    0x76, 0x98, 0x86, 0xbc, 0x65, 0x1d, 0x06, 0xb0, 0xcc, 0x53, 0xb0, 0xf6,
+    0x3b, 0xce, 0x3c, 0x3e, 0x27, 0xd2, 0x60, 0x4b
+};
+static const unsigned char P256_GX[32] = {
+    0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5,
+    0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0,
+    0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96
+};
+static const unsigned char P256_GY[32] = {
+    0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a,
+    0x7c, 0x0f, 0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce,
+    0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5
+};
+
+/* r = (a - b) mod p. */
+static void fp_sub(const struct bn *a, const struct bn *b, const struct bn *p, struct bn *r) {
+    if (bn_cmp(a, b) >= 0) {
+        bn_sub(a, b, r);
+    } else {
+        struct bn d, t;
+        bn_sub(b, a, &d);
+        bn_sub(p, &d, &t);
+        *r = t;
+    }
+}
+
+/* r = base^exp mod m, exp a full-size (256-bit scale) exponent. */
+static void bn_powmod(const struct bn *base, const struct bn *exp, const struct bn *m,
+                      struct bn *r) {
+    struct bn acc, b, t;
+    memset(&acc, 0, sizeof(acc));
+    acc.limbs[0] = 1;
+    acc.n = 1;
+    bn_mod(base, m, &b);
+    for (int i = exp->n - 1; i >= 0; i--) {
+        for (int bit = 31; bit >= 0; bit--) {
+            bn_mulmod(&acc, &acc, m, &t);
+            acc = t;
+            if ((exp->limbs[i] >> bit) & 1) {
+                bn_mulmod(&acc, &b, m, &t);
+                acc = t;
+            }
+        }
+    }
+    *r = acc;
+}
+
+/* out = 1/a mod p via Fermat (a^(p-2)). */
+static void fp_inv(const struct bn *a, const struct bn *p, struct bn *out) {
+    struct bn e, two, exp;
+    bn_from_bytes(&e, P256_P, 32);
+    memset(&two, 0, sizeof(two));
+    two.limbs[0] = 2;
+    two.n = 1;
+    bn_sub(&e, &two, &exp);   /* exp = p - 2 */
+    bn_powmod(a, &exp, p, out);
+}
+
+struct p256_pt {
+    struct bn x;
+    struct bn y;
+    int inf;
+};
+
+static void p256_base(struct bn *p, const unsigned char bytes[32]) {
+    bn_from_bytes(p, bytes, 32);
+}
+
+/* Doubles p in place (affine). Requires p not at infinity. */
+static void p256_double(struct p256_pt *p, const struct bn *mod) {
+    struct bn x2, s, inv, xr, yr, t1, t2;
+    bn_mulmod(&p->x, &p->x, mod, &x2);          /* x^2 */
+    bn_addmod(&x2, &x2, mod, &t1);
+    bn_addmod(&t1, &x2, mod, &s);               /* s = 3x^2 */
+    /* a = -3, so 3x^2 + a: subtract 3. */
+    {
+        struct bn three;
+        memset(&three, 0, sizeof(three));
+        three.limbs[0] = 3;
+        three.n = 1;
+        fp_sub(&s, &three, mod, &t1);
+        s = t1;
+    }
+    bn_addmod(&p->y, &p->y, mod, &t1);          /* 2y */
+    fp_inv(&t1, mod, &inv);
+    bn_mulmod(&s, &inv, mod, &t1);              /* slope */
+    bn_mulmod(&t1, &t1, mod, &t2);
+    fp_sub(&t2, &p->x, mod, &xr);
+    fp_sub(&xr, &p->x, mod, &t2);
+    xr = t2;                                    /* xr = s^2 - 2x */
+    fp_sub(&p->x, &xr, mod, &t2);
+    bn_mulmod(&t1, &t2, mod, &yr);
+    fp_sub(&yr, &p->y, mod, &t2);
+    yr = t2;                                    /* yr = s(x-xr) - y */
+    p->x = xr;
+    p->y = yr;
+}
+
+/* r = p + q (affine). Handles infinity and doubling/opposites. */
+static void p256_add(const struct p256_pt *p, const struct p256_pt *q, const struct bn *mod,
+                     struct p256_pt *r) {
+    if (p->inf) {
+        *r = *q;
+        return;
+    }
+    if (q->inf) {
+        *r = *p;
+        return;
+    }
+    if (bn_cmp(&p->x, &q->x) == 0) {
+        struct bn ysum, t;
+        bn_addmod(&p->y, &q->y, mod, &ysum);
+        /* ysum == 0 mod p means opposite points (or both zero). */
+        memset(&t, 0, sizeof(t));
+        t.n = 1;
+        if (bn_cmp(&ysum, &t) == 0) {
+            r->inf = 1;
+            return;
+        }
+        *r = *p;
+        p256_double(r, mod);
+        return;
+    }
+    struct bn dy, dx, inv, s, xr, yr, t;
+    fp_sub(&q->y, &p->y, mod, &dy);
+    fp_sub(&q->x, &p->x, mod, &dx);
+    fp_inv(&dx, mod, &inv);
+    bn_mulmod(&dy, &inv, mod, &s);
+    bn_mulmod(&s, &s, mod, &t);
+    fp_sub(&t, &p->x, mod, &xr);
+    fp_sub(&xr, &q->x, mod, &t);
+    xr = t;
+    fp_sub(&p->x, &xr, mod, &t);
+    bn_mulmod(&s, &t, mod, &yr);
+    fp_sub(&yr, &p->y, mod, &t);
+    yr = t;
+    r->x = xr;
+    r->y = yr;
+    r->inf = 0;
+}
+
+/* r = k * base by double-and-add (MSB first). k must be nonzero. */
+static void p256_mul(const struct bn *k, const struct p256_pt *base, const struct bn *mod,
+                     struct p256_pt *r) {
+    struct p256_pt acc;
+    memset(&acc, 0, sizeof(acc));
+    acc.inf = 1;
+    int started = 0;
+    for (int i = k->n - 1; i >= 0; i--) {
+        for (int bit = 31; bit >= 0; bit--) {
+            if (started) {
+                struct p256_pt t;
+                p256_add(&acc, &acc, mod, &t);
+                acc = t;
+            }
+            if ((k->limbs[i] >> bit) & 1) {
+                started = 1;
+                struct p256_pt t;
+                p256_add(&acc, base, mod, &t);
+                acc = t;
+            }
+        }
+    }
+    *r = acc;
+}
+
+/* True when (x, y) satisfies y^2 = x^3 - 3x + b over the field. */
+static int p256_valid(const struct bn *x, const struct bn *y, const struct bn *b,
+                      const struct bn *mod) {
+    struct bn lhs, x2, x3, ax, rhs, t, three;
+    bn_mulmod(y, y, mod, &lhs);
+    bn_mulmod(x, x, mod, &x2);
+    bn_mulmod(&x2, x, mod, &x3);
+    memset(&three, 0, sizeof(three));
+    three.limbs[0] = 3;
+    three.n = 1;
+    /* x^3 - 3x + b. */
+    bn_addmod(x, x, mod, &t);
+    bn_addmod(&t, x, mod, &ax);       /* ax = 3x */
+    fp_sub(&x3, &ax, mod, &t);
+    bn_addmod(&t, b, mod, &rhs);
+    return bn_cmp(&lhs, &rhs) == 0;
+}
+
 /* ---------------- DER walk ---------------- */
 
 /* Reads a TLV header at *at: tag byte, total header length, content length. */
@@ -1009,6 +1218,172 @@ static int cbc_protect(struct tls_ctx *t, const unsigned char *pt, size_t ptlen)
     return 0;
 }
 
+/* ---------------- AES-GCM (suite 0xC02F) ----------------
+ *
+ * TLS 1.2 GCM: nonce = 4-byte salt (key block) + 8-byte explicit nonce on
+ * the wire (we send the sequence number, the common practice), AES-CTR
+ * from counter 2, 16-byte tag over AAD + ciphertext.
+ */
+
+/* r = x * H in GF(2^128) (big-endian blocks, poly x^128+x^7+x^2+x+1). */
+static void ghash_mul(const unsigned char x[16], const unsigned char h[16],
+                      unsigned char r[16]) {
+    unsigned char v[16], z[16];
+    memcpy(v, h, 16);
+    memset(z, 0, 16);
+    for (int i = 0; i < 16; i++) {
+        for (int bit = 7; bit >= 0; bit--) {
+            if ((x[i] >> bit) & 1) {
+                for (int k = 0; k < 16; k++) z[k] ^= v[k];
+            }
+            int lsb = v[15] & 1;
+            for (int k = 15; k > 0; k--) v[k] = (unsigned char)((v[k] >> 1) | ((v[k - 1] & 1) << 7));
+            v[0] >>= 1;
+            if (lsb) v[0] ^= 0xe1;
+        }
+    }
+    memcpy(r, z, 16);
+}
+
+/* GHASH over aad || ciphertext with the standard length block. */
+static void ghash(const unsigned char h[16], const unsigned char *aad, size_t alen,
+                  const unsigned char *ct, size_t ctlen, unsigned char out[16]) {
+    unsigned char y[16];
+    memset(y, 0, 16);
+    unsigned char blk[16];
+    size_t i = 0;
+    /* AAD is always our 13-byte record header here; pad to one block. */
+    memset(blk, 0, 16);
+    memcpy(blk, aad, alen > 16 ? 16 : alen);
+    ghash_mul(blk, h, y);
+    /* Full blocks... AAD fits one block; assert that below by construction. */
+    while (i + 16 <= ctlen) {
+        for (int k = 0; k < 16; k++) blk[k] = (unsigned char)(y[k] ^ ct[i + k]);
+        ghash_mul(blk, h, y);
+        i += 16;
+    }
+    if (i < ctlen) {
+        memset(blk, 0, 16);
+        memcpy(blk, ct + i, ctlen - i);
+        for (int k = 0; k < 16; k++) blk[k] ^= y[k];
+        ghash_mul(blk, h, y);
+    }
+    memset(blk, 0, 16);
+    unsigned long long alen_bits = (unsigned long long)alen * 8;
+    unsigned long long ctlen_bits = (unsigned long long)ctlen * 8;
+    for (int k = 0; k < 8; k++) {
+        blk[k] = (unsigned char)(alen_bits >> (56 - 8 * k));
+        blk[8 + k] = (unsigned char)(ctlen_bits >> (56 - 8 * k));
+    }
+    for (int k = 0; k < 16; k++) blk[k] ^= y[k];
+    ghash_mul(blk, h, y);
+    memcpy(out, y, 16);
+}
+
+/* AES-CTR from counter block ctr0 (GCM data starts at 2). */
+static void aes_ctr(struct aes128 *aes, const unsigned char nonce12[12], unsigned ctr0,
+                    const unsigned char *in, size_t n, unsigned char *out) {
+    unsigned char ctr[16], ks[16];
+    memcpy(ctr, nonce12, 12);
+    size_t off = 0;
+    unsigned c = ctr0;
+    while (off < n) {
+        ctr[12] = (unsigned char)(c >> 24);
+        ctr[13] = (unsigned char)(c >> 16);
+        ctr[14] = (unsigned char)(c >> 8);
+        ctr[15] = (unsigned char)c;
+        aes_enc_block(aes, ctr, ks);
+        size_t take = n - off < 16 ? n - off : 16;
+        for (size_t k = 0; k < take; k++) out[off + k] = (unsigned char)(in[off + k] ^ ks[k]);
+        off += take;
+        c++;
+    }
+    memset(ks, 0, sizeof(ks));
+}
+
+/* Builds one GCM record payload: explicit nonce + ciphertext + tag.
+ * Returns a malloc'd buffer with *outlen set, or NULL. Advances write_seq
+ * like cbc_protect does. */
+static unsigned char *gcm_protect(struct tls_ctx *t, unsigned char type,
+                                  const unsigned char *pt, size_t ptlen, size_t *outlen) {
+    const unsigned char *key = t->cwkey;
+    const unsigned char *salt = t->cwiv;
+    unsigned long long seq = t->write_seq;
+    t->write_seq++;
+    unsigned char *out = malloc(8 + ptlen + 16);
+    if (!out) return NULL;
+    unsigned char nonce[12];
+    memcpy(nonce, salt, 4);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)(seq >> (56 - 8 * i));
+        out[i] = nonce[4 + i];
+    }
+    struct aes128 aes;
+    aes_key(&aes, key);
+    aes_ctr(&aes, nonce, 2, pt, ptlen, out + 8);
+    unsigned char h[16] = {0};
+    aes_enc_block(&aes, h, h);
+    unsigned char aad[13];
+    for (int i = 0; i < 8; i++) aad[i] = (unsigned char)(seq >> (56 - 8 * i));
+    aad[8] = type;
+    aad[9] = TLS_VER_MAJOR;
+    aad[10] = TLS_VER_MINOR;
+    aad[11] = (unsigned char)(ptlen >> 8);
+    aad[12] = (unsigned char)ptlen;
+    unsigned char tag[16], mask[16], j0[16];
+    ghash(h, aad, 13, out + 8, ptlen, tag);
+    memcpy(j0, nonce, 12);
+    memset(j0 + 12, 0, 4);
+    j0[15] = 1;
+    aes_enc_block(&aes, j0, mask);
+    for (int i = 0; i < 16; i++) out[8 + ptlen + i] = (unsigned char)(tag[i] ^ mask[i]);
+    memset(tag, 0, sizeof(tag));
+    memset(mask, 0, sizeof(mask));
+    *outlen = 8 + ptlen + 16;
+    return out;
+}
+
+/* Verifies and decrypts one GCM record in place (ciphertext slides front).
+ * expect is the content type the AAD must name. Advances read_seq on
+ * success like cbc_unprotect does. */
+static int gcm_unprotect(struct tls_ctx *t, unsigned char expect, unsigned char *rec,
+                         size_t reclen, size_t *plainlen) {
+    const unsigned char *key = t->swkey;
+    const unsigned char *salt = t->swiv;
+    unsigned long long seq = t->read_seq;
+    if (reclen < 8 + 16) return -1;
+    size_t ctlen = reclen - 8 - 16;
+    unsigned char nonce[12];
+    memcpy(nonce, salt, 4);
+    memcpy(nonce + 4, rec, 8);
+    struct aes128 aes;
+    aes_key(&aes, key);
+    unsigned char h[16] = {0};
+    aes_enc_block(&aes, h, h);
+    unsigned char aad[13];
+    for (int i = 0; i < 8; i++) aad[i] = (unsigned char)(seq >> (56 - 8 * i));
+    aad[8] = expect;
+    aad[9] = TLS_VER_MAJOR;
+    aad[10] = TLS_VER_MINOR;
+    aad[11] = (unsigned char)(ctlen >> 8);
+    aad[12] = (unsigned char)ctlen;
+    unsigned char tag[16], mask[16], j0[16];
+    ghash(h, aad, 13, rec + 8, ctlen, tag);
+    memcpy(j0, nonce, 12);
+    memset(j0 + 12, 0, 4);
+    j0[15] = 1;
+    aes_enc_block(&aes, j0, mask);
+    unsigned diff = 0;
+    for (int i = 0; i < 16; i++) diff |= (unsigned)((rec[8 + ctlen + i] ^ mask[i]) ^ tag[i]);
+    memset(tag, 0, sizeof(tag));
+    memset(mask, 0, sizeof(mask));
+    if (diff) return -1;
+    aes_ctr(&aes, nonce, 2, rec + 8, ctlen, rec);
+    *plainlen = ctlen;
+    t->read_seq++;
+    return 0;
+}
+
 /* ---------------- handshake ---------------- */
 
 int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t errcap) {
@@ -1041,20 +1416,23 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
     memcpy(hello + hl, crnd, 32);
     hl += 32;
     hello[hl++] = 0; /* no session */
+    /* Two suites, modern first: ECDHE+RSA+GCM, then RSA+CBC fallback. */
     hello[hl++] = 0;
-    hello[hl++] = 2; /* one suite */
+    hello[hl++] = 4;
+    hello[hl++] = 0xc0;
+    hello[hl++] = 0x2f;
     hello[hl++] = 0x00;
     hello[hl++] = 0x2f;
     hello[hl++] = 1; /* one compression method */
     hello[hl++] = 0; /* null */
-    /* SNI extension. Lengths count only the bytes that follow them:
-     * extensions(2 + 9+hlen), server_name(2 + 5+hlen),
-     * server_name_list(2 + 3+hlen), host_name(1 + 2+hlen).
-     * A second extension follows (signature_algorithms, 14 bytes), so the
-     * extensions length covers the SNI extension (9+hlen) plus those 14. */
+    /* Extensions: SNI (9+hlen), signature_algorithms restricted to the one
+     * scheme this client verifies (rsa_pkcs1_sha256, 8 bytes),
+     * supported_groups secp256r1 (8), ec_point_formats uncompressed (6),
+     * ALPN http/1.1 (15), empty renegotiation_info (5, which servers
+     * expect as a matter of course). Total: 51+hlen. */
     size_t hlen = strlen(host);
     if (hlen == 0 || hlen > 255) FAIL("bad hostname");
-    size_t extlen = 9 + hlen + 14;
+    size_t extlen = 51 + hlen;
     if (extlen > 0xffff) FAIL("bad hostname");
     {
         hello[hl++] = (unsigned char)(extlen >> 8);
@@ -1070,21 +1448,52 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
         hello[hl++] = (unsigned char)hlen;
         memcpy(hello + hl, host, hlen);
         hl += hlen;
-        /* signature_algorithms: RSA PKCS#1 with SHA-256/384/512/1, the only
-         * peer signatures this client can check (and modern servers demand the
-         * extension before choosing one). */
-        {
-            static const unsigned char schemes[] = {0x04, 0x01, 0x05, 0x01,
-                                                    0x06, 0x01, 0x02, 0x01};
-            hello[hl++] = 0x00;
-            hello[hl++] = 0x0d;
-            hello[hl++] = 0x00;
-            hello[hl++] = 0x0a;
-            hello[hl++] = 0x00;
-            hello[hl++] = 0x08;
-            memcpy(hello + hl, schemes, sizeof(schemes));
-            hl += sizeof(schemes);
-        }
+        /* signature_algorithms: rsa_pkcs1_sha256 only. Offering more would
+         * invite signatures this client cannot check; servers honour the
+         * restriction (and demand the extension before choosing). */
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x0d;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x04;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x02;
+        hello[hl++] = 0x04;
+        hello[hl++] = 0x01;
+        /* supported_groups: secp256r1. */
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x0a;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x04;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x02;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x17;
+        /* ec_point_formats: uncompressed. */
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x0b;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x02;
+        hello[hl++] = 0x01;
+        hello[hl++] = 0x00;
+        /* ALPN: http/1.1 (this client speaks nothing else). Lengths are
+         * over the 8 protocol bytes; no NUL goes on the wire. */
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x10;
+        hello[hl++] = 0x00;
+        hello[hl++] = 11; /* ext_data: list(2) + name_len(1) + 8 */
+        hello[hl++] = 0x00;
+        hello[hl++] = 9;  /* list length */
+        hello[hl++] = 8;  /* name length */
+        memcpy(hello + hl, "http/1.1", 8);
+        hl += 8;
+        /* Empty renegotiation_info (RFC 5746): a single zero byte of
+         * extension data. Absence is legal, but some stacks only accept
+         * its presence. */
+        hello[hl++] = 0xff;
+        hello[hl++] = 0x01;
+        hello[hl++] = 0x00;
+        hello[hl++] = 0x01;
+        hello[hl++] = 0x00;
     }
     size_t body = hl - hlen_at - 3;
     hello[hlen_at] = (unsigned char)(body >> 16);
@@ -1106,15 +1515,18 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
     } while (0)
     TRANS_ADD(hello, hl);
 
-    /* Server flight: ServerHello, Certificate, ServerHelloDone, in order,
-     * possibly coalesced or fragmented across records. */
+    /* Server flight: ServerHello, Certificate, [ServerKeyExchange,]
+     * ServerHelloDone, in order, possibly coalesced or fragmented across
+     * records. SKE appears only for ECDHE suites. */
     unsigned char rec[REC_MAX + 5];
     size_t recn = 0;
     unsigned char msgb[REC_MAX + 5];
     size_t msgn = 0;
-    int stage = 0; /* 0 SH, 1 CERT, 2 SHD */
+    int stage = 0; /* 0 SH, 1 CERT, 2 SKE-or-SHD, 3 done */
     size_t cert_len = 0;
     static unsigned char cert[CERT_MAX];
+    static unsigned char ske_x[32], ske_y[32];
+    int ske_seen = 0;
     while (stage < 3) {
         unsigned char type;
         size_t n = 0;
@@ -1141,7 +1553,7 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             continue;
         }
         if ((stage == 0 && htype != 2) || (stage == 1 && htype != 11) ||
-            (stage == 2 && htype != 14))
+            (stage == 2 && htype != 12 && htype != 14) || stage > 2)
             FAIL("unexpected handshake order");
         TRANS_ADD(msgb, 4 + hlen2);
         if (getenv("TLS_DUMP"))
@@ -1159,7 +1571,13 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
                 /* Unlike ClientHello's length-prefixed vector, ServerHello
                  * names exactly one suite in a fixed 2-byte field. */
                 if (si + 2 > hlen2) FAIL("short ServerHello suites");
-                if (mb[si] != 0x00 || mb[si + 1] != 0x2f) FAIL("suite not offered");
+                if (mb[si] == 0xc0 && mb[si + 1] == 0x2f) {
+                    t->suite = SUITE_ECDHE_RSA_AES128_GCM;
+                } else if (mb[si] == 0x00 && mb[si + 1] == 0x2f) {
+                    t->suite = SUITE_RSA_AES128_SHA;
+                } else {
+                    FAIL("suite not offered");
+                }
                 si += 2;
             }
             if (si >= hlen2 || mb[si] != 0) FAIL("no null compression");
@@ -1174,12 +1592,83 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             if (ci + c0 > hlen2 || c0 > CERT_MAX) FAIL("cert too big");
             memcpy(cert, mb + ci, c0);
             cert_len = c0;
+        } else if (stage == 2 && htype == 12) {
+            /* ServerKeyExchange for ECDHE: named curve secp256r1 with an
+             * uncompressed point, RSA/SHA-256 signed. The signature covers
+             * client_random + server_random + the curve params exactly as
+             * they appear on the wire. */
+            if (t->suite != SUITE_ECDHE_RSA_AES128_GCM) FAIL("stray SKE");
+            if (hlen2 < 4 + 65 + 4) FAIL("short SKE");
+            if (mb[0] != 3 || mb[1] != 0x00 || mb[2] != 0x17) FAIL("SKE curve");
+            if (mb[3] != 65 || mb[4] != 0x04) FAIL("SKE point");
+            size_t params_len = 4 + 65;
+            size_t si = params_len;
+            if (mb[si] != 0x04 || mb[si + 1] != 0x01) FAIL("SKE sigalg");
+            size_t slen = ((size_t)mb[si + 2] << 8) | mb[si + 3];
+            si += 4;
+            if (si + slen != hlen2) FAIL("SKE sig length");
+            /* Validate the point before any crypto touches it. */
+            {
+                struct bn px, py, pmod, bb;
+                bn_from_bytes(&px, mb + 5, 32);
+                bn_from_bytes(&py, mb + 5 + 32, 32);
+                bn_from_bytes(&pmod, P256_P, 32);
+                bn_from_bytes(&bb, P256_B, 32);
+                if (!p256_valid(&px, &py, &bb, &pmod)) FAIL("SKE off-curve");
+                memcpy(ske_x, mb + 5, 32);
+                memcpy(ske_y, mb + 5 + 32, 32);
+            }
+            /* RSA-verify the signature with the certificate's key. */
+            {
+                struct bn smod;
+                unsigned sexp = 0;
+                const unsigned char *d1 = NULL, *d2 = NULL;
+                size_t l1 = 0, l2 = 0;
+                if (cert_rsa_pubkey(cert, cert_len, &smod, &sexp, &d1, &l1, &d2, &l2) < 0)
+                    FAIL("SKE cert parse");
+                if (sexp == 0 || sexp > 0xffffff) FAIL("SKE bad exponent");
+                unsigned char hash[32];
+                {
+                    struct sha256 c;
+                    sha256_init(&c);
+                    sha256_update(&c, crnd, 32);
+                    sha256_update(&c, srnd, 32);
+                    sha256_update(&c, mb, params_len);
+                    sha256_final(&c, hash);
+                }
+                struct bn sig, em;
+                bn_from_bytes(&sig, mb + si, slen);
+                bn_powmod_u32(&sig, sexp, &smod, &em);
+                /* EM must be k bytes: 00 01 FF..FF 00 DigestInfo SHA-256 hash. */
+                unsigned char embuf[512];
+                size_t kn = slen;
+                if (kn < 19 + 32 + 11 || kn > sizeof(embuf)) FAIL("SKE sig size");
+                bn_to_bytes(&em, embuf, kn);
+                static const unsigned char PREFIX[19] = {
+                    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+                    0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
+                };
+                if (embuf[0] != 0x00 || embuf[1] != 0x01) FAIL("SKE sig shape");
+                size_t pi = 2;
+                while (pi < kn && embuf[pi] == 0xff) pi++;
+                if (pi < 10 || pi >= kn || embuf[pi] != 0x00) FAIL("SKE sig pad");
+                pi++;
+                if (kn - pi != 19 + 32) FAIL("SKE sig tail");
+                if (memcmp(embuf + pi, PREFIX, 19) != 0) FAIL("SKE digest id");
+                unsigned diff = 0;
+                for (int i = 0; i < 32; i++) diff |= (unsigned)(embuf[pi + 19 + i] ^ hash[i]);
+                memset(embuf, 0, kn);
+                if (diff) FAIL("SKE sig verify");
+            }
+            ske_seen = 1;
         }
         /* Consume. */
         memmove(msgb, msgb + 4 + hlen2, msgn - 4 - hlen2);
         msgn -= 4 + hlen2;
-        stage++;
+        /* SKE does not advance the stage: ServerHelloDone still follows. */
+        if (htype != 12) stage++;
     }
+    if (t->suite == SUITE_ECDHE_RSA_AES128_GCM && !ske_seen) FAIL("ECDHE without SKE");
     (void)recn;
 
     /* Authenticate: RSA key + hostname (+expiry sanity, warn-only). */
@@ -1193,18 +1682,36 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
         FAIL("cert parse");
     if (exp == 0 || exp > 0xffffff) FAIL("bad exponent");
     int cn_ok = (cn && host_match(cn, cnlen, host) == 0);
-    /* SAN dNSName entries live in 0x82 strings inside the SAN extension. */
+    /* SAN dNSName entries: walk the extension value as DER (OID, optional
+     * critical flag, OCTET STRING wrapping a SEQUENCE OF GeneralName) so
+     * long SAN lists match wherever the name sits, with exact lengths. */
     int san_ok = 0, san_present = 0;
     {
         static const unsigned char SAN_OID[] = {0x06, 0x03, 0x55, 0x1d, 0x11};
         for (size_t i = 0; i + sizeof(SAN_OID) <= cert_len; i++) {
             if (memcmp(cert + i, SAN_OID, sizeof(SAN_OID)) != 0) continue;
-            /* Scan the following 512 bytes for dNSName (0x82) strings. */
-            for (size_t j = i; j + 2 < cert_len && j < i + 512; j++) {
-                if (cert[j] == 0x82 && j + 2 + cert[j + 1] <= cert_len) {
+            size_t at = i + sizeof(SAN_OID);
+            unsigned char tag = 0;
+            size_t clen = 0;
+            if (at < cert_len && cert[at] == 0x01) {
+                /* critical BOOLEAN, always 3 bytes (01 01 FF). */
+                at += 3;
+            }
+            /* extnValue OCTET STRING ... */
+            if (der_head(cert, cert_len, &at, &tag, &clen) < 0 || tag != 0x04) break;
+            size_t vend = at + clen;
+            /* ... wrapping a SEQUENCE OF GeneralName. */
+            if (der_head(cert, cert_len, &at, &tag, &clen) < 0 || tag != 0x30) break;
+            size_t send = at + clen;
+            if (send > vend) break;
+            while (at + 2 <= send) {
+                if (der_head(cert, cert_len, &at, &tag, &clen) < 0) break;
+                if (at + clen > send) break;
+                if (tag == 0x82) {
                     san_present = 1;
-                    if (host_match(cert + j + 2, cert[j + 1], host) == 0) san_ok = 1;
+                    if (host_match(cert + at, clen, host) == 0) san_ok = 1;
                 }
+                at += clen;
             }
             break;
         }
@@ -1221,7 +1728,67 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             snprintf(err, errcap, "note: certificate expired (continuing)");
     }
 
-    /* ClientKeyExchange with RSAES-PKCS1-v1_5. */
+    /* ClientKeyExchange: ECDHE point or RSAES-PKCS1-v1_5. */
+    size_t prelen = 48;
+    if (t->suite == SUITE_ECDHE_RSA_AES128_GCM) {
+        /* Ephemeral keypair dG, then Z = d * server_point. The premaster
+         * is x(Z) as exactly 32 bytes (P-256 coordinate size). */
+        struct bn pmod, nord, d, gx, gy, sx, sy;
+        struct p256_pt base, mine, shared;
+        bn_from_bytes(&pmod, P256_P, 32);
+        bn_from_bytes(&nord, P256_N, 32);
+        bn_from_bytes(&gx, P256_GX, 32);
+        bn_from_bytes(&gy, P256_GY, 32);
+        bn_from_bytes(&sx, ske_x, 32);
+        bn_from_bytes(&sy, ske_y, 32);
+        base.x = gx;
+        base.y = gy;
+        base.inf = 0;
+        unsigned char draw[32];
+        if (rand_bytes(draw, 32) < 0) FAIL("no entropy");
+        bn_from_bytes(&d, draw, 32);
+        memset(draw, 0, sizeof(draw));
+        /* 1 <= d <= n-1. */
+        {
+            struct bn one, nm1, t;
+            memset(&one, 0, sizeof(one));
+            one.limbs[0] = 1;
+            one.n = 1;
+            bn_sub(&nord, &one, &nm1);       /* n - 1 */
+            bn_mod(&d, &nm1, &t);
+            bn_addmod(&t, &one, &nord, &d);  /* d = d mod (n-1) + 1 */
+        }
+        p256_mul(&d, &base, &pmod, &mine);
+        if (mine.inf) FAIL("bad ephemeral");
+        {
+            struct p256_pt srv;
+            srv.x = sx;
+            srv.y = sy;
+            srv.inf = 0;
+            p256_mul(&d, &srv, &pmod, &shared);
+        }
+        memset(&d, 0, sizeof(d));
+        if (shared.inf) FAIL("bad ECDH");
+        unsigned char cke[4 + 1 + 65];
+        cke[0] = 16; /* ClientKeyExchange */
+        cke[1] = 0;
+        cke[2] = 0;
+        cke[3] = 66; /* 1 length byte + 65 point bytes */
+        cke[4] = 65;
+        cke[5] = 0x04;
+        bn_to_bytes(&shared.x, pre, 32);
+        prelen = 32;
+        bn_to_bytes(&mine.x, cke + 6, 32);
+        bn_to_bytes(&mine.y, cke + 6 + 32, 32);
+        memset(&shared, 0, sizeof(shared));
+        memset(&mine, 0, sizeof(mine));
+        TRANS_ADD(cke, sizeof(cke));
+        if (send_record(fd, 22, cke, sizeof(cke)) < 0) {
+            memset(cke, 0, sizeof(cke));
+            FAIL("send CKE");
+        }
+        memset(cke, 0, sizeof(cke));
+    } else {
     pre[0] = 3;
     pre[1] = 3;
     if (rand_bytes(pre + 2, 46) < 0) FAIL("no entropy");
@@ -1280,22 +1847,34 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
         memset(em, 0, sizeof(em));
         free(cke);
     }
+    } /* end RSA branch */
 
-    /* Master secret + key block (SHA-256 PRF). */
+    /* Master secret + key block (SHA-256 PRF). GCM needs no MAC keys:
+     * 16 client key + 16 server key + 4 client salt + 4 server salt. */
     {
         unsigned char mseed[64], kseed[64];
         memcpy(mseed, crnd, 32);
         memcpy(mseed + 32, srnd, 32);
-        tls_prf(pre, 48, "master secret", mseed, 64, master, 48);
+        tls_prf(pre, prelen, "master secret", mseed, 64, master, 48);
         memcpy(kseed, srnd, 32);
         memcpy(kseed + 32, crnd, 32);
-        unsigned char block[104];
-        tls_prf(master, 48, "key expansion", kseed, 64, block, sizeof(block));
-        memcpy(t->client_mac, block, 20);
-        memcpy(t->server_mac, block + 20, 20);
-        memcpy(t->client_key, block + 40, 16);
-        memcpy(t->server_key, block + 56, 16);
-        memset(block, 0, sizeof(block));
+        if (t->suite == SUITE_ECDHE_RSA_AES128_GCM) {
+            unsigned char block[40];
+            tls_prf(master, 48, "key expansion", kseed, 64, block, sizeof(block));
+            memcpy(t->cwkey, block, 16);
+            memcpy(t->swkey, block + 16, 16);
+            memcpy(t->cwiv, block + 32, 4);
+            memcpy(t->swiv, block + 36, 4);
+            memset(block, 0, sizeof(block));
+        } else {
+            unsigned char block[104];
+            tls_prf(master, 48, "key expansion", kseed, 64, block, sizeof(block));
+            memcpy(t->client_mac, block, 20);
+            memcpy(t->server_mac, block + 20, 20);
+            memcpy(t->client_key, block + 40, 16);
+            memcpy(t->server_key, block + 56, 16);
+            memset(block, 0, sizeof(block));
+        }
         memset(mseed, 0, sizeof(mseed));
         memset(kseed, 0, sizeof(kseed));
     }
@@ -1342,8 +1921,21 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
         /* Finished goes out encrypted under the new keys. */
         t->write_seq = 0;
         t->read_seq = 0;
+        if (t->suite == SUITE_ECDHE_RSA_AES128_GCM) {
+            size_t flen = 0;
+            unsigned char *frec = gcm_protect(t, 22, fin, 16, &flen);
+            memset(fin, 0, sizeof(fin));
+            if (!frec) FAIL("oom");
+            if (send_record(fd, 22, frec, flen) < 0) {
+                memset(frec, 0, flen);
+                free(frec);
+                FAIL("send Finished");
+            }
+            memset(frec, 0, flen);
+            free(frec);
+        }
         /* Encrypt manually: plaintext is the handshake message. */
-        {
+        if (t->suite != SUITE_ECDHE_RSA_AES128_GCM) {
             size_t frag = 16 + 20;
             unsigned pad = (unsigned)((16 - ((frag + 1) % 16)) % 16);
             size_t body = frag + 1 + pad;
@@ -1437,6 +2029,15 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
         unsigned char *blk = malloc(rn);
         if (!blk) FAIL("oom");
         memcpy(blk, rhdr, rn);
+        size_t msglen = 0;
+        if (t->suite == SUITE_ECDHE_RSA_AES128_GCM) {
+            size_t ptlen = 0;
+            if (gcm_unprotect(t, 22, blk, rn, &ptlen) < 0) {
+                free(blk);
+                FAIL("Finished decrypt");
+            }
+            msglen = ptlen;
+        } else {
         size_t ptlen = 0;
         /* Temporarily verify with type 22 instead of 23. */
         if (rn < 16 + 20 + 1) {
@@ -1469,7 +2070,7 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             free(blk);
             FAIL("Finished short");
         }
-        size_t msglen = ptl - 20;
+        msglen = ptl - 20;
         unsigned char hdr[13];
         for (int i = 0; i < 8; i++) hdr[i] = 0; /* server read_seq was 0 */
         hdr[8] = 22;
@@ -1502,6 +2103,7 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             free(blk);
             FAIL("Finished MAC");
         }
+        } /* end CBC-only Finished decryption */
         /* Verify_data: first 12 bytes are the Finished body. */
         if (msglen != 16 || blk[0] != 20 || blk[1] != 0 || blk[2] != 0 || blk[3] != 12) {
             free(blk);
@@ -1518,7 +2120,7 @@ int tls_handshake(int fd, const char *host, struct tls_ctx *t, char *err, size_t
             sha256_final(&c, hh);
             tls_prf(master, 48, "server finished", hh, 32, expect, 12);
         }
-        diff = 0;
+        unsigned diff = 0;
         for (int i = 0; i < 12; i++) diff |= (unsigned)(blk[4 + i] ^ expect[i]);
         memset(blk, 0, rn);
         free(blk);
@@ -1538,7 +2140,21 @@ ssize_t tls_write(struct tls_ctx *t, const void *buf, size_t n) {
     size_t left = n;
     while (left > 0) {
         size_t take = left < 14000 ? left : 14000;
-        if (cbc_protect(t, p, take) < 0) {
+        if (t->suite == SUITE_ECDHE_RSA_AES128_GCM) {
+            size_t olen = 0;
+            unsigned char *rec = gcm_protect(t, 23, p, take, &olen);
+            if (!rec) {
+                errno = EIO;
+                return -1;
+            }
+            int r = send_record(t->fd, 23, rec, olen);
+            memset(rec, 0, olen);
+            free(rec);
+            if (r < 0) {
+                errno = EIO;
+                return -1;
+            }
+        } else if (cbc_protect(t, p, take) < 0) {
             errno = EIO;
             return -1;
         }
@@ -1594,7 +2210,12 @@ ssize_t tls_read(struct tls_ctx *t, void *buf, size_t n) {
         break;
     }
     size_t ptlen = 0;
-    if (cbc_unprotect(t, rec, rn, &ptlen) < 0) {
+    int ok;
+    if (t->suite == SUITE_ECDHE_RSA_AES128_GCM)
+        ok = gcm_unprotect(t, 23, rec, rn, &ptlen);
+    else
+        ok = cbc_unprotect(t, rec, rn, &ptlen);
+    if (ok < 0) {
         errno = EIO;
         return -1;
     }
@@ -1626,4 +2247,8 @@ void tls_free(struct tls_ctx *t) {
     memset(t->server_mac, 0, sizeof(t->server_mac));
     memset(t->client_key, 0, sizeof(t->client_key));
     memset(t->server_key, 0, sizeof(t->server_key));
+    memset(t->cwkey, 0, sizeof(t->cwkey));
+    memset(t->swkey, 0, sizeof(t->swkey));
+    memset(t->cwiv, 0, sizeof(t->cwiv));
+    memset(t->swiv, 0, sizeof(t->swiv));
 }

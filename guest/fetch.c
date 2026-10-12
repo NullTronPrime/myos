@@ -1,8 +1,10 @@
 /* fetch: minimal HTTP client proving guest networking works.
  *
  * Resolves a hostname (exercises the bridged /etc/resolv.conf path),
- * connects over TCP, sends an HTTP/1.0 request and prints the response.
- * Usage: fetch <host> [port] [path]
+ * connects over TCP, sends an HTTP/1.1 request and prints the response.
+ * Usage: fetch <host> [port] [path] [--body]
+ * An https:// URL prefix selects TLS (default :443). --body also dumps
+ * the response body to stdout (headers always print).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -27,12 +29,15 @@ int main(int argc, char **argv) {
     static char hostbuf[256];
     static char portbuf[16];
     static char pathbuf[512];
+    /* A trailing --body flag is not a positional argument. */
+    int pos = argc;
+    if (pos > 1 && strcmp(argv[pos - 1], "--body") == 0) pos--;
     if (strncmp(host, "https://", 8) == 0) {
         secure = 1;
         snprintf(hostbuf, sizeof(hostbuf), "%s", host + 8);
         char *slash = strchr(hostbuf, '/');
         if (slash) {
-            if (argc <= 3) {
+            if (pos <= 3) {
                 snprintf(pathbuf, sizeof(pathbuf), "%s", slash);
                 path = pathbuf;
             }
@@ -42,11 +47,11 @@ int main(int argc, char **argv) {
         char *colon = strchr(hostbuf, ':');
         if (colon) {
             *colon = '\0';
-            if (argc <= 2) {
+            if (pos <= 2) {
                 snprintf(portbuf, sizeof(portbuf), "%s", colon + 1);
                 port = portbuf;
             }
-        } else if (argc <= 2) {
+        } else if (pos <= 2) {
             port = "443";
         }
         host = hostbuf;
@@ -63,19 +68,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "fetch: bad port\n");
         return 1;
     }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr = addr;
-    sa.sin_port = (unsigned short)(((pnum & 0xff) << 8) | ((pnum >> 8) & 0xff));
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = tcp_connect_timeout(&addr, pnum, 10000);
     if (fd < 0) {
-        perror("fetch: socket");
-        return 1;
-    }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         perror("fetch: connect");
-        close(fd);
         return 1;
     }
 
@@ -92,8 +87,9 @@ int main(int argc, char **argv) {
     }
 
     char req[1024];
+    /* HTTP/1.1: some servers (DuckDuckGo's nginx) answer 400 to 1.0. */
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: myos-fetch\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) myos-fetch\r\nConnection: close\r\n\r\n",
              path, host);
     size_t left = strlen(req);
     const char *p = req;
@@ -114,12 +110,18 @@ int main(int argc, char **argv) {
 
     size_t total = 0;
     int lines = 0;
+    /* Guests start with an empty environment by design, so debug switches
+     * ride on argv, not env. */
+    int dump = 0;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--body") == 0) dump = 1;
     char buf[4096];
     ssize_t n;
     for (;;) {
         n = secure ? tls_read(&tls, buf, sizeof(buf) - 1) : recv(fd, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         total += (size_t)n;
+        if (dump) fwrite(buf, 1, (size_t)n, stdout);
         // Print the status line and headers (up to the first blank line).
         if (lines < 12) {
             buf[n] = '\0';

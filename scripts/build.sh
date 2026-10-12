@@ -16,7 +16,7 @@ cc=${CC:-gcc}
 mkdir -p "$out" "$root/bin" "$root/etc" "$root/dev" "$root/lib"
 
 # Guests that link the host's static glibc: fixed-address, no interpreter.
-for g in sh sh2 init window_server desktop_shell terminal input_test catfile catstdin proc_parent proc_child fb_paint; do
+for g in sh sh2 init window_server desktop_shell terminal input_test catfile catstdin proc_parent proc_child fb_paint beep; do
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/$g" "guest/$g.c"
 done
 

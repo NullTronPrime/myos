@@ -123,6 +123,9 @@ pub struct Display {
     /// context, which leaves `PutImage` with nothing to draw through. That is
     /// worth discovering once, at start-up, rather than once per frame.
     pixels: bool,
+    /// Sticky read buffer: the socket is a byte stream, so packet framing
+    /// survives short reads by accumulating here.
+    rbuf: Vec<u8>,
 }
 
 static DISPLAY: OnceLock<Mutex<Option<Display>>> = OnceLock::new();
@@ -245,13 +248,21 @@ pub fn present(frame: &[u8]) {
     if w != d.width || h != d.height {
         // The guest resized its window; the server needs to be told before the
         // image will fit, and a failed request would desynchronise the stream.
+        // Failure is reported (once per process) rather than silently
+        // painting black: a stuck size mismatch is otherwise undebuggable.
         if d.resize(w, h).is_none() {
+            static RESIZE_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !RESIZE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("myos: display resize to {}x{} refused", w, h);
+            }
             return;
         }
     }
     // A failure here means the server is gone. Dropping the connection lets the
     // guest keep running headless rather than writing into a dead socket.
     if d.put_image(&pixels, w, h).is_none() {
+        eprintln!("myos: DBG display put_image failed, dropping connection");
         *guard = None;
         return;
     }
@@ -259,6 +270,7 @@ pub fn present(frame: &[u8]) {
     // rather than a reply. Reading without waiting costs nothing and turns "the
     // screen is blank for no visible reason" into a message that says why.
     if d.read_packets(false).is_err() {
+        eprintln!("myos: DBG display read failed after present, dropping connection");
         *guard = None;
     }
 }
@@ -317,6 +329,20 @@ impl Display {
     fn open() -> Option<Display> {
         let path = socket_path()?;
         let mut stream = UnixStream::connect(&path).ok()?;
+        // Close-on-exec: forked-then-exec'd children inherit every fd, and
+        // every myos process pumps its own X socket before each syscall. A
+        // shared socket means N readers splitting one packet stream, which
+        // desynchronises ALL of them (dead input, vanishing windows). The
+        // creating process must be the only reader, so children never
+        // inherit it.
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                return None;
+            }
+        }
         stream.set_read_timeout(Some(SERVER_TIMEOUT)).ok()?;
         stream.set_write_timeout(Some(SERVER_TIMEOUT)).ok()?;
 
@@ -384,16 +410,20 @@ impl Display {
             events: 0,
             probing: true,
             pixels: false,
+            rbuf: Vec::new(),
         };
 
         let window = d.next_id();
+        // Embedded clients parent to the desktop's window (same visual and
+        // depth throughout the tree, so the root's serve the child too).
+        let parent = embed_parent().unwrap_or(root);
         // Find an event mask this server will actually deliver. A rejected mask
         // leaves no window behind at all, so the refusal has to be noticed here
         // rather than left to surface later as a screen that never updates.
         let mut chosen = None;
         for (i, (label, mask)) in EVENT_MASKS.iter().enumerate() {
             d.bad_value = false;
-            d.create_window(root, root_visual, root_depth, window, width, height, *mask)?;
+            d.create_window(parent, root_visual, root_depth, window, width, height, *mask)?;
             d.settle();
             if !d.bad_value {
                 if i != 0 {
@@ -760,6 +790,64 @@ fn display_size() -> (u32, u32) {
     (env("MYOS_WIDTH", 640), env("MYOS_HEIGHT", 480))
 }
 
+/// An X window to parent this client's window to, for embedded mode.
+///
+/// `MYOS_EMBED_PARENT` names the desktop's outer window (decimal or 0x
+/// hex). The child window then lives INSIDE the desktop's top-level
+/// window instead of opening a second one: one OS window on the host,
+/// with the desktop compositor and the app side by side in it. Input
+/// keeps flowing over the child's own connection, so no other code
+/// changes.
+fn embed_parent() -> Option<u32> {
+    let s = std::env::var("MYOS_EMBED_PARENT").ok()?;
+    let s = s.trim();
+    let v = if let Some(h) = s.strip_prefix("0x") {
+        u32::from_str_radix(h, 16).ok()?
+    } else {
+        s.parse::<u32>().ok()?
+    };
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// This client's outer X window id, for rendezvous (the desktop publishes
+/// it so apps can reparent into it).
+pub fn xid() -> Option<u32> {
+    slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|d| d.window)
+}
+
+/// Moves the outer window (embedded drag). Coordinates are parent-relative
+/// i16s; the guest model move is handled by the dispatcher, this only
+/// tells the server.
+pub fn move_outer(x: i32, y: i32) -> bool {
+    let mut guard = slot().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(d) = guard.as_mut() else {
+        return false;
+    };
+    let mut req = Vec::with_capacity(16);
+    req.push(OP_CONFIGURE_WINDOW);
+    req.push(0); // unused
+    req.extend_from_slice(&[0, 0]); // request length, filled in below
+    req.extend_from_slice(&d.window.to_le_bytes());
+    req.extend_from_slice(&0x0000_0003u16.to_le_bytes()); // x | y
+    req.extend_from_slice(&[0, 0]); // unused
+    req.extend_from_slice(&(x as i16).to_le_bytes());
+    req.extend_from_slice(&[0, 0]); // padding
+    req.extend_from_slice(&(y as i16).to_le_bytes());
+    req.extend_from_slice(&[0, 0]); // padding
+    if finish(&mut req, 2).is_none() {
+        return false;
+    }
+    write_all(&mut d.stream, &req).is_some()
+}
+
 /// Builds the connection setup request.
 fn handshake(name: &[u8], data: &[u8]) -> Vec<u8> {
     let mut req = Vec::with_capacity(12 + name.len() + data.len());
@@ -840,12 +928,18 @@ pub fn poll_events() -> Vec<Event> {
     let raw = match d.read_packets(false) {
         Ok(r) => r,
         Err(()) => {
+            eprintln!("myos: DBG display read failed in poll, dropping connection");
             *guard = None;
             return Vec::new();
         }
     };
+    // Every 32-byte packet that is not an error or a reply is an event:
+    // genuine server events carry codes 2-35 WITHOUT the high bit (that
+    // bit is the SendEvent flag for synthetic events only), so filtering
+    // on it strands all real input. Errors and replies fall through
+    // decode_event to None.
     raw.iter()
-        .filter(|p| p[0] & 0x80 != 0)
+        .filter(|p| p[0] != 0 && p[0] != 1)
         .filter_map(|p| decode_event(p, d.window))
         .collect()
 }
@@ -904,16 +998,22 @@ impl Display {
     /// Replies and errors are counted off the outstanding-replies total and
     /// discarded: the requests this module sends do not ask for anything back
     /// that the guest needs to see.
+    ///
+    /// The socket is a byte stream, not a message pipe: a short read is
+    /// normal traffic (pointer bursts fragment all the time), so bytes
+    /// accumulate in a sticky buffer and packets split off it. Only EOF or
+    /// a hard error drops the connection.
     fn read_packets(&mut self, wait: bool) -> Result<Vec<[u8; 32]>, ()> {
-        if wait {
-            // One blocking read first, so a caller that needs to know whether a
-            // void request was accepted actually waits for the verdict instead of
-            // concluding "no news is good news" before the error has arrived.
-            let mut pkt = [0u8; 32];
-            match self.stream.read(&mut pkt) {
-                Ok(n) if n == 32 => self.take(pkt),
+        if wait && self.rbuf.len() < 32 {
+            // One blocking byte first, so a caller that needs to know whether
+            // a void request was accepted actually waits for the verdict
+            // instead of concluding "no news is good news" before the error
+            // has arrived. Quiet is an empty answer, not a dead server.
+            self.stream.set_nonblocking(false).map_err(|_| ())?;
+            let mut one = [0u8; 1];
+            match self.stream.read(&mut one) {
                 Ok(0) => return Err(()),
-                Ok(_) => return Err(()),
+                Ok(_) => self.rbuf.push(one[0]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -924,22 +1024,18 @@ impl Display {
                 Err(_) => return Err(()),
             }
         }
-        // A non-blocking read leaves the socket in whatever state the server
-        // last put it in, which is exactly what the length field in the first
-        // four bytes of the next packet expects.
+        // Drain whatever is waiting into the sticky buffer.
         self.stream.set_nonblocking(true).map_err(|_| ())?;
-        let mut out = Vec::new();
         loop {
-            let mut pkt = [0u8; 32];
-            match self.stream.read(&mut pkt) {
+            let mut tmp = [0u8; 512];
+            match self.stream.read(&mut tmp) {
                 Ok(0) => return Err(()),
-                Ok(n) if n == 32 => {
-                    self.take(pkt);
-                    out.push(pkt);
+                Ok(n) => {
+                    self.rbuf.extend_from_slice(&tmp[..n]);
+                    if self.rbuf.len() > 65536 {
+                        return Err(());
+                    }
                 }
-                // A short read would desynchronise the stream, so the
-                // connection is dropped rather than resynchronised.
-                Ok(_) => return Err(()),
                 // Nothing waiting is the normal case between frames. The
                 // non-blocking mode never reports a timeout, but both spellings
                 // are handled so the pump also works if the mode is dropped.
@@ -954,6 +1050,13 @@ impl Display {
             }
         }
         self.stream.set_nonblocking(false).map_err(|_| ())?;
+        let mut out = Vec::new();
+        while self.rbuf.len() >= 32 {
+            let pkt: [u8; 32] = self.rbuf[..32].try_into().map_err(|_| ())?;
+            self.take(pkt);
+            out.push(pkt);
+            self.rbuf.drain(..32);
+        }
         Ok(out)
     }
 }
@@ -971,14 +1074,14 @@ fn decode_event(p: &[u8; 32], window: u32) -> Option<Event> {
             let mods = modifiers(word(28));
             Some(Event::key_down(
                 window,
-                keysym(keycode),
+                keysym(keycode, mods.shift),
                 mods,
                 keycode >= 38 && keycode <= 58,
             ))
         }
         ev::KEY_RELEASE => {
             let mods = modifiers(word(28));
-            Some(Event::key_up(window, keysym(p[1]), mods))
+            Some(Event::key_up(window, keysym(p[1], mods.shift), mods))
         }
         ev::BUTTON_PRESS => {
             let mods = modifiers(word(28));
@@ -1051,13 +1154,67 @@ fn button(b: u8) -> Button {
 /// round trip; the layout below covers the PC/XT arrangement that every server
 /// uses as a minimum, which is enough to type with. Anything unmapped becomes
 /// `XK_VoidSymbol`, and the guest still sees the key press and release.
-fn keysym(keycode: u8) -> i32 {
+/// Shift selects the upper symbol (letters go uppercase); guests treat the
+/// shift bit as consumed by the keysym and keep rejecting ctrl/alt combos.
+fn keysym(keycode: u8, shifted: bool) -> i32 {
     const VOID: i32 = 0xffff;
+    if shifted {
+        return match keycode {
+            38 => b'A' as i32,
+            39 => b'S' as i32,
+            40 => b'D' as i32,
+            41 => b'F' as i32,
+            42 => b'G' as i32,
+            43 => b'H' as i32,
+            44 => b'J' as i32,
+            45 => b'K' as i32,
+            46 => b'L' as i32,
+            52 => b'Z' as i32,
+            53 => b'X' as i32,
+            54 => b'C' as i32,
+            55 => b'V' as i32,
+            56 => b'B' as i32,
+            57 => b'N' as i32,
+            58 => b'M' as i32,
+            24 => b'Q' as i32,
+            25 => b'W' as i32,
+            26 => b'E' as i32,
+            27 => b'R' as i32,
+            28 => b'T' as i32,
+            29 => b'Y' as i32,
+            30 => b'U' as i32,
+            31 => b'I' as i32,
+            32 => b'O' as i32,
+            33 => b'P' as i32,
+            34 => b'{' as i32,
+            35 => b'}' as i32,
+            47 => b':' as i32,
+            48 => b'"' as i32,
+            49 => b'~' as i32,
+            51 => b'|' as i32,
+            59 => b'<' as i32,
+            60 => b'>' as i32,
+            61 => b'?' as i32,
+            20 => b'_' as i32,
+            21 => b'+' as i32,
+            10 => b'!' as i32,
+            11 => b'@' as i32,
+            12 => b'#' as i32,
+            13 => b'$' as i32,
+            14 => b'%' as i32,
+            15 => b'^' as i32,
+            16 => b'&' as i32,
+            17 => b'*' as i32,
+            18 => b'(' as i32,
+            19 => b')' as i32,
+            _ => VOID,
+        };
+    }
     match keycode {
         9 => 0xff1b,  // Escape
         22 => 0xff08, // BackSpace
         23 => 0xff09, // Tab
-        36 => 0xff0d, // Return
+        36 | 104 => 0xff0d, // Return (104 is keypad Enter)
         37 => 0xffe3, // Control_L
         38 => b'a' as i32,
         39 => b's' as i32,
@@ -1077,9 +1234,30 @@ fn keysym(keycode: u8) -> i32 {
         57 => b'n' as i32,
         58 => b'm' as i32,
         65 => 0x20, // space
+        20 => b'-' as i32,
+        21 => b'=' as i32,
         10..=19 => b'1' as i32 + (keycode as i32 - 10),
-        24..=32 => b'q' as i32 + (keycode as i32 - 24),
-        33..=34 => b'[' as i32 + (keycode as i32 - 33),
+        // Top letter row, spelled out: qwerty is NOT contiguous in ASCII,
+        // so `b'q' + offset` decodes o as y (and w as r, e as s, ...).
+        24 => b'q' as i32,
+        25 => b'w' as i32,
+        26 => b'e' as i32,
+        27 => b'r' as i32,
+        28 => b't' as i32,
+        29 => b'y' as i32,
+        30 => b'u' as i32,
+        31 => b'i' as i32,
+        32 => b'o' as i32,
+        33 => b'p' as i32,
+        34 => b'[' as i32,
+        35 => b']' as i32,
+        47 => b';' as i32,
+        48 => b'\'' as i32,
+        49 => b'`' as i32,
+        51 => b'\\' as i32,
+        59 => b',' as i32,
+        60 => b'.' as i32,
+        61 => b'/' as i32,
         111 | 110 => 0xff51, // Up, Down
         113 | 114 => 0xff52, // Left, Right
         119 => 0xff50,       // Home
@@ -1087,6 +1265,37 @@ fn keysym(keycode: u8) -> i32 {
         117 => 0xff57,       // End
         116 => 0xff54,       // Next / Page Down
         _ => VOID,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The top letter row is not ASCII-contiguous; arithmetic here once
+    /// decoded "google.com" as "gy..." (o->y, e->s).
+    #[test]
+    fn keysym_decodes_a_url() {
+        let word: String = [42, 32, 32, 42, 46, 26, 60, 54, 32, 58]
+            .iter()
+            .map(|&kc| keysym(kc, false) as u8 as char)
+            .collect();
+        assert_eq!(word, "google.com");
+    }
+
+    #[test]
+    fn keysym_maps_both_enter_keys() {
+        assert_eq!(keysym(36, false), 0xff0d);
+        assert_eq!(keysym(104, false), 0xff0d);
+    }
+
+    #[test]
+    fn keysym_shift_selects_upper_symbols() {
+        // https:// needs Shift for the colon (and the host for capitals).
+        assert_eq!(keysym(47, true), b':' as i32);
+        assert_eq!(keysym(42, true), b'G' as i32);
+        assert_eq!(keysym(10, true), b'!' as i32);
+        assert_eq!(keysym(47, false), b';' as i32);
     }
 }
 

@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <time.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #define SYS_DISPLAY_INFO    0x1000
 #define SYS_WINDOW_CREATE   0x1001
@@ -39,10 +40,13 @@
 #define SYS_WINDOW_MINIMIZE 0x1014
 #define SYS_WINDOW_LOWER    0x1015
 #define SYS_WINDOW_GET_TITLE 0x1016
+#define SYS_DISPLAY_XID     0x1017
 
 #define PANEL_HEIGHT 32
 #define MAX_APPS 8
 #define MAX_WINBTN 32
+/* Taskbar grid: launcher pill occupies x<72, app slots are 100px wide. */
+#define SLOT_X0 72
 
 // Alt+Tab switcher: KeyDown for XK_Tab with the Alt modifier bit.
 #define EV_KEYDOWN 1
@@ -76,6 +80,21 @@ static struct app_entry apps[MAX_APPS] = {
 static int panel_win = -1;
 static unsigned long panel_buf = 0;
 static int panel_w = 0, panel_h = 0;
+static int wall_win = -1;
+static unsigned int disp_w = 0, disp_h = 0;
+static struct window_info panel_info;
+
+/* App index occupying a visible slot (inactive apps collapse, so slot !=
+ * index once anything is off). -1 when the slot is empty. */
+static int app_at_slot(int slot) {
+    int s = 0;
+    for (int i = 0; i < MAX_APPS; i++) {
+        if (!apps[i].active) continue;
+        if (s == slot) return i;
+        s++;
+    }
+    return -1;
+}
 
 // Own windows for Alt+Tab, refreshed with the panel redraw. Untitled
 // windows (wallpaper) and the panel itself are not browsable entries.
@@ -165,6 +184,43 @@ static int die(const char *what) {
     return 1;
 }
 
+static void draw_wallpaper(unsigned long buf, unsigned int w, unsigned int h);
+static void draw_panel(unsigned long buf, unsigned int w, unsigned int h);
+
+/* (Re)builds wallpaper + panel for a WxH desktop: used at startup and
+ * when the host resizes the window (ConfigureNotify arrives as kind 9).
+ * Old windows are destroyed; their mappings leak until exit, one per
+ * resize, which a toy desktop accepts. Returns 0 or -1. */
+static int build_desktop(unsigned int w, unsigned int h) {
+    if (w < 320 || h < 200 || w > 2048 || h > 2048) return -1;
+    if (wall_win >= 0) syscall(SYS_WINDOW_DESTROY, wall_win, 0, 0, 0, 0, 0);
+    if (panel_win >= 0) syscall(SYS_WINDOW_DESTROY, panel_win, 0, 0, 0, 0, 0);
+    disp_w = w;
+    disp_h = h;
+    // Wallpaper window (full screen, bottom of z-order)
+    wall_win = (int)syscall(SYS_WINDOW_CREATE, w, h, 0, 0, 0, 0);
+    if (wall_win < 0) return die("window_create wallpaper");
+    struct window_info wall_info;
+    unsigned long wall_buf = (unsigned long)syscall(SYS_WINDOW_MAP, wall_win, &wall_info, 0, 0, 0, 0);
+    if (wall_buf == 0) return die("window_map wallpaper");
+    draw_wallpaper(wall_buf, wall_info.width, wall_info.height);
+    syscall(SYS_WINDOW_PRESENT, wall_win, 0, 0, 0, 0, 0);
+
+    // Panel window (bottom of the screen, on top of the wallpaper)
+    panel_w = (int)w;
+    panel_h = PANEL_HEIGHT;
+    panel_win = (int)syscall(SYS_WINDOW_CREATE, panel_w, panel_h, 0, 0, 0, 0);
+    if (panel_win < 0) return die("window_create panel");
+    panel_buf = (unsigned long)syscall(SYS_WINDOW_MAP, panel_win, &panel_info, 0, 0, 0, 0);
+    if (panel_buf == 0) return die("window_map panel");
+    syscall(SYS_WINDOW_MOVE, panel_win, 0, (int)h - PANEL_HEIGHT, 0, 0, 0);
+    syscall(SYS_WINDOW_SET_TITLE, panel_win, "myos panel", 0, 0, 0, 0);
+    draw_panel(panel_buf, panel_info.width, panel_info.height);
+    syscall(SYS_WINDOW_PRESENT, panel_win, 0, 0, 0, 0, 0);
+    fprintf(stderr, "desktop_shell: desktop %ux%u\n", w, h);
+    return 0;
+}
+
 static void draw_wallpaper(unsigned long buf, unsigned int w, unsigned int h) {
     unsigned int *px = (unsigned int *)buf;
     for (unsigned int y = 0; y < h; y++) {
@@ -178,48 +234,83 @@ static void draw_wallpaper(unsigned long buf, unsigned int w, unsigned int h) {
     }
 }
 
-static void draw_panel(unsigned long buf, unsigned int w, unsigned int h) {
-    unsigned int *px = (unsigned int *)buf;
-    // Panel background
-    for (unsigned int y = 0; y < h; y++) {
-        for (unsigned int x = 0; x < w; x++) {
-            px[y * w + x] = 0x00202030;
+/* Pixel helpers: rounded tiles like a modern dock. Corners are cut by
+ * skipping a radius-r square at each corner (r=0 is a plain rect). */
+static void tile(unsigned int *px, unsigned int w, unsigned int h,
+                 int x0, int y0, int bw, int bh, int r, unsigned int color) {
+    for (int y = 0; y < bh; y++) {
+        for (int x = 0; x < bw; x++) {
+            int cx = x < r ? r - 1 - x : (x >= bw - r ? x - (bw - r) : -1);
+            int cy = y < r ? r - 1 - y : (y >= bh - r ? y - (bh - r) : -1);
+            if (cx >= 0 && cy >= 0 && cx * cx + cy * cy >= r * r) continue;
+            int sx = x0 + x, sy = y0 + y;
+            if (sx >= 0 && sy >= 0 && (unsigned)sx < w && (unsigned)sy < h)
+                px[sy * w + sx] = color;
         }
     }
-    // Draw app buttons
-    for (int i = 0; i < MAX_APPS; i++) {
-        if (!apps[i].active) continue;
-        int bx = 8 + i * 100;
-        int by = 4;
-        int bw = 92;
-        int bh = 24;
-        // Button background
-        for (unsigned int y = by; y < by + bh && y < h; y++) {
-            for (unsigned int x = bx; x < bx + bw && x < w; x++) {
-                px[y * w + x] = 0x00404060;
+}
+
+/* Per-app tile colors (icon-ish, Brave-dock style). */
+static unsigned int app_color(const char *name) {
+    if (strcmp(name, "Browser") == 0) return 0x00FB542B; /* brave orange */
+    if (strcmp(name, "Terminal") == 0) return 0x004A4A4A; /* gray square */
+    if (strcmp(name, "Shell") == 0) return 0x002E7D32;    /* green */
+    if (strcmp(name, "Files") == 0) return 0x00C09800;    /* folder yellow */
+    if (strcmp(name, "Clock") == 0) return 0x005C6BC0;    /* muted blue */
+    if (strcmp(name, "Paint") == 0) return 0x008E24AA;    /* purple */
+    return 0x00404060;
+}
+
+static void draw_panel(unsigned long buf, unsigned int w, unsigned int h) {
+    unsigned int *px = (unsigned int *)buf;
+    /* Bar background: dark dock gray. */
+    for (unsigned int y = 0; y < h; y++) {
+        for (unsigned int x = 0; x < w; x++) {
+            px[y * w + x] = 0x00323232;
+        }
+    }
+    /* Launcher pill with a 2x2 grid glyph. */
+    tile(px, w, h, 8, 4, 56, 24, 8, 0x00444444);
+    tile(px, w, h, 20, 10, 6, 6, 1, 0x00DDDDDD);
+    tile(px, w, h, 28, 10, 6, 6, 1, 0x00DDDDDD);
+    tile(px, w, h, 20, 18, 6, 6, 1, 0x00DDDDDD);
+    tile(px, w, h, 28, 18, 6, 6, 1, 0x00DDDDDD);
+    /* App tiles: icon block + running underline. Slots share the 100px
+     * grid the click hit-test uses (SLOT_X0 + slot*100). */
+    int nslots = 0;
+    for (int slot = 0; ; slot++) {
+        int i = app_at_slot(slot);
+        if (i < 0) break;
+        int bx = SLOT_X0 + slot * 100;
+        if (bx + 92 > (int)w) break;
+        nslots = slot + 1;
+        tile(px, w, h, bx, 4, 40, 24, 5, app_color(apps[i].name));
+        /* Running indicator: census name matches this app. */
+        for (int c = 0; c < ncen; c++) {
+            if (strcasecmp(cen_names[c], apps[i].name) == 0) {
+                tile(px, w, h, bx + 6, 26, 28, 3, 1, 0x004C8DFF);
+                break;
             }
         }
-        // Button text
-        // (simplified - just draw a colored rectangle)
     }
     // Census entries (other processes' apps), right of the launcher.
     // Only active launchers occupy space; inactive slots collapse.
-    winbtn_x0 = 8;
-    for (int i = 0; i < MAX_APPS; i++) {
-        if (apps[i].active) winbtn_x0 += 100;
-    }
+    winbtn_x0 = SLOT_X0 + nslots * 100;
     for (int i = 0; i < ncen; i++) {
         int bx = winbtn_x0 + i * 100;
         if (bx + 92 > (int)w) break; // clip: no room for another entry
-        int by = 4;
-        int bw = 92;
-        int bh = 24;
-        for (unsigned int y = by; y < by + bh && y < h; y++) {
-            for (unsigned int x = bx; x < bx + bw && x < w; x++) {
-                px[y * w + x] = 0x00303048;
-            }
-        }
+        tile(px, w, h, bx, 4, 40, 24, 5, 0x00262626);
     }
+}
+
+/* Reads the published outer-window id for embedding, or -1. */
+static long desktop_xid(void) {
+    FILE *f = fopen("/winserv/desktop/xid", "r");
+    if (!f) return -1;
+    long xid = -1;
+    if (fscanf(f, "%li", &xid) != 1) xid = -1;
+    fclose(f);
+    return xid;
 }
 
 static void launch_app(const char *cmd) {
@@ -230,12 +321,29 @@ static void launch_app(const char *cmd) {
     if (pid == 0) {
         // Child: exec the app
         char *argv[] = {(char *)cmd, NULL};
-        char *envp[] = {
-            "PATH=/bin:/usr/bin",
-            "HOME=/",
-            "TERM=myos",
-            NULL
-        };
+        char embed_parent[64];
+        char *envp[8];
+        int ne = 0;
+        envp[ne++] = "PATH=/bin:/usr/bin";
+        envp[ne++] = "HOME=/";
+        envp[ne++] = "TERM=myos";
+        /* The browser lives INSIDE the desktop window: its outer X
+         * window reparents into ours (one OS window on the host),
+         * sized to the area above the panel. */
+        if (strcmp(cmd, "browser") == 0) {
+            long xid = desktop_xid();
+            if (xid > 0) {
+                snprintf(embed_parent, sizeof(embed_parent),
+                         "MYOS_EMBED_PARENT=%li", xid);
+                envp[ne++] = embed_parent;
+                /* Guest model and host window must agree exactly: any
+                 * mismatch sends every frame down the resize path. */
+                envp[ne++] = "MYOS_WIDTH=640";
+                envp[ne++] = "MYOS_HEIGHT=448";
+                envp[ne++] = "MYOS_DISPLAY=640x448";
+            }
+        }
+        envp[ne] = NULL;
         execve(cmd, argv, envp);
         // If exec fails, try /bin/ prefix
         char path[256];
@@ -255,27 +363,9 @@ int main(void) {
         return 1;
     }
 
-    // Wallpaper window (full screen, bottom of z-order)
-    long wall_win = syscall(SYS_WINDOW_CREATE, di.width, di.height, 0, 0, 0, 0);
-    if (wall_win < 0) return die("window_create wallpaper");
-    struct window_info wall_info;
-    unsigned long wall_buf = (unsigned long)syscall(SYS_WINDOW_MAP, wall_win, &wall_info, 0, 0, 0, 0);
-    if (wall_buf == 0) return die("window_map wallpaper");
-    draw_wallpaper(wall_buf, wall_info.width, wall_info.height);
-    syscall(SYS_WINDOW_PRESENT, wall_win, 0, 0, 0, 0, 0);
-
-    // Panel window (bottom of the screen, on top of the wallpaper)
-    panel_w = di.width;
-    panel_h = PANEL_HEIGHT;
-    panel_win = (int)syscall(SYS_WINDOW_CREATE, panel_w, panel_h, 0, 0, 0, 0);
-    if (panel_win < 0) return die("window_create panel");
-    struct window_info panel_info;
-    panel_buf = (unsigned long)syscall(SYS_WINDOW_MAP, panel_win, &panel_info, 0, 0, 0, 0);
-    if (panel_buf == 0) return die("window_map panel");
-    syscall(SYS_WINDOW_MOVE, panel_win, 0, di.height - PANEL_HEIGHT, 0, 0, 0);
-    syscall(SYS_WINDOW_SET_TITLE, panel_win, "myos panel", 0, 0, 0, 0);
-    draw_panel(panel_buf, panel_info.width, panel_info.height);
-    syscall(SYS_WINDOW_PRESENT, panel_win, 0, 0, 0, 0, 0);
+    disp_w = di.width;
+    disp_h = di.height;
+    if (build_desktop(disp_w, disp_h) < 0) return 1;
 
     // Composite every visible window into one frame. The kernel writes
     // it to MYOS_FB_OUT (or pushes it to the real window) when this
@@ -283,6 +373,20 @@ int main(void) {
     long pr = syscall(SYS_DISPLAY_PRESENT, 0, 0, 0, 0, 0, 0);
     fprintf(stderr, "desktop_shell: display_present returned %ld\n", pr);
     fprintf(stderr, "desktop_shell: %dx%d, first frame presented\n", di.width, di.height);
+
+    /* Publish the outer window id so apps can embed into this window. */
+    {
+        long xid = syscall(SYS_DISPLAY_XID, 0, 0, 0, 0, 0, 0);
+        if (xid > 0) {
+            mkdir("/winserv", 0755);
+            mkdir("/winserv/desktop", 0755);
+            FILE *f = fopen("/winserv/desktop/xid", "w");
+            if (f) {
+                fprintf(f, "%li\n", xid);
+                fclose(f);
+            }
+        }
+    }
 
     // Input loop: the kernel pumps host events into this fd.
     long input_fd = syscall(SYS_INPUT_FD, 0, 0, 0, 0, 0, 0);
@@ -306,11 +410,17 @@ int main(void) {
                     (event.mods & MOD_ALT)) {
                     cycle_focus();
                 }
+                // kind 9 is a host resize: rebuild for the new size.
+                if (event.kind == 9 && event.width >= 320 && event.height >= 200) {
+                    if (build_desktop(event.width, event.height) == 0)
+                        frame_counter = 29; /* redraw on the next pass */
+                }
                 // kind 3 is a mouse button press
-                if (event.kind == 3 && event.y >= (int)di.height - PANEL_HEIGHT) {
-                    int btn = (event.x - 8) / 100;
-                    if (btn >= 0 && btn < MAX_APPS && apps[btn].active) {
-                        launch_app(apps[btn].cmd);
+                if (event.kind == 3 && event.y >= (int)disp_h - PANEL_HEIGHT) {
+                    int slot = (event.x - SLOT_X0) / 100;
+                    int ai = slot >= 0 ? app_at_slot(slot) : -1;
+                    if (ai >= 0) {
+                        launch_app(apps[ai].cmd);
                     }
                     /* Census entries are display-only: their windows live
                      * in other processes and cannot be focused from here. */
@@ -321,19 +431,29 @@ int main(void) {
             refresh_window_list();
             refresh_census();
             draw_panel(panel_buf, panel_info.width, panel_info.height);
-            // App labels through the kernel's 8x8 text renderer.
-            for (int i = 0; i < MAX_APPS; i++) {
-                if (!apps[i].active) continue;
-                syscall(SYS_WINDOW_DRAW_TEXT, panel_win, 8 + i * 100 + 6, 12,
-                        0x00FFFFFF, 0xffffffffL, apps[i].name);
+            // App labels through the kernel's 8x8 text renderer: a
+            // glyph letter on the icon plus a short name beside it.
+            for (int slot = 0; ; slot++) {
+                int i = app_at_slot(slot);
+                if (i < 0) break;
+                int bx = SLOT_X0 + slot * 100;
+                if (bx + 92 > (int)panel_info.width) break;
+                char glyph[2] = {(char)(apps[i].name[0] | 0x20), '\0'};
+                if (glyph[0] < 'a' || glyph[0] > 'z') glyph[0] = apps[i].name[0];
+                syscall(SYS_WINDOW_DRAW_TEXT, panel_win, bx + 16, 12,
+                        0x00FFFFFF, 0xffffffffL, glyph);
+                char shortn[8];
+                snprintf(shortn, sizeof(shortn), "%.6s", apps[i].name);
+                syscall(SYS_WINDOW_DRAW_TEXT, panel_win, bx + 44, 12,
+                        0x00DDDDDD, 0xffffffffL, shortn);
             }
             // Census names next to the launcher block.
             for (int i = 0; i < ncen; i++) {
                 int bx = winbtn_x0 + i * 100;
                 if (bx + 92 > (int)panel_info.width) break;
-                char label[14];
-                snprintf(label, sizeof(label), "*%.10s", cen_names[i]);
-                syscall(SYS_WINDOW_DRAW_TEXT, panel_win, bx + 6, 12,
+                char label[10];
+                snprintf(label, sizeof(label), "*%.6s", cen_names[i]);
+                syscall(SYS_WINDOW_DRAW_TEXT, panel_win, bx + 44, 12,
                         0x0000FF00, 0xffffffffL, label);
             }
             // Clock at the right edge (guest gettimeofday is dispatched).

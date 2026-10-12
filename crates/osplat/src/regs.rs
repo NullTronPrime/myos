@@ -50,6 +50,20 @@ pub fn set_return(uc: &mut ucontext_t, value: i64) {
     }
 }
 
+/// Restores the syscall number into a signal frame.
+///
+/// A rewound syscall re-executes the instruction at the stepped-back `rip`,
+/// and the kernel takes the number to run from `rax` — which by then holds
+/// whatever result was just written for the abandoned attempt. Without this
+/// the guest re-runs syscall 0 (`read`) with the old call's arguments, and
+/// the mysterious `EBADF` that follows looks like the kernel's doing.
+pub fn set_nr(uc: &mut ucontext_t, nr: i64) {
+    unsafe {
+        let base = &mut uc.uc_mcontext.gregs as *mut greg_t as *mut u64;
+        *base.add(REG_RAX) = nr as u64;
+    }
+}
+
 /// Returns the instruction pointer the guest will resume at.
 pub fn instruction_pointer(uc: &ucontext_t) -> u64 {
     uc.uc_mcontext.gregs[REG_RIP] as u64

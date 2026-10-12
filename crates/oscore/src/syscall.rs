@@ -197,6 +197,12 @@ pub const SYS_WINDOW_LOWER: i64 = 0x1015;
 /// Returns the full title length (excluding NUL); longer titles are
 /// truncated. A zero capacity probes the length.
 pub const SYS_WINDOW_GET_TITLE: i64 = 0x1016;
+/// Returns this client's outer host-window id (for embedding rendezvous).
+///
+/// The desktop publishes it under `/winserv/desktop/xid` so launched apps
+/// can reparent into it via `MYOS_EMBED_PARENT`. Negative errno when there
+/// is no display server.
+pub const SYS_DISPLAY_XID: i64 = 0x1017;
 /// The descriptor to read input events from, allocated on first call.
 ///
 /// Input is a stream rather than a global so that a guest which loses interest
@@ -1425,8 +1431,9 @@ pub fn dispatch<M: GuestMemory>(
                 let revents = poll_fd(fd, events, fds, &state.input, &state.eventfds, state.poll_host);
                 results.push((events, revents));
             }
-            // For simplicity, check all fds immediately. If none are ready and timeout > 0,
-            // we would need to block. For now, return immediately.
+            // Takes an instant snapshot only: the timeout is honoured by the
+            // platform layer, which waits on host fds and re-runs the call.
+            // Returning immediately here is the contract, not a shortcut.
             let ready_count = results.iter().filter(|(_, r)| *r != 0).count();
             // Write revents back to guest memory
             for (i, (_, revents)) in results.iter().enumerate() {

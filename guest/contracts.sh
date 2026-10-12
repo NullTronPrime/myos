@@ -287,6 +287,77 @@ if [[ -x $MYOS ]]; then
     else
         bad "no_restorer: rc=$rc out=$r"
     fi
+
+    # 20. poll(2) waits: an empty pipe reports nothing only after the
+    #     timeout (an instant zero strands DNS and every other timed wait),
+    #     and ready data returns at once.
+    "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/poll_test" poll_test.c || exit 1
+    r=$("$MYOS" "$out/poll_test" 2>/dev/null); rc=$?
+    if has "POLL_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
+        ok "poll with a timeout waits for readiness"
+    else
+        bad "poll_test: rc=$rc out=$r"
+    fi
+
+    # 21. Guest crypto self-checks: P-256 group order, ECDH consistency,
+    #     and AES-GCM round-trip/tamper, natively and under myos alike.
+    "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/ec_test" ec_test.c || exit 1
+    r=$("$MYOS" "$out/ec_test" 2>/dev/null); rc=$?
+    if has "EC_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
+        ok "P-256 + GCM self-checks pass under myos"
+    else
+        bad "ec_test: rc=$rc out=$r"
+    fi
+
+    # 22. TLS against a local OpenSSL server: ECDHE+GCM when that is all
+    #     the server offers, and the RSA+CBC fallback when it is. Needs
+    #     openssl and python3; skipped without them (no external network).
+    if [[ -x "$out/fetch" ]] && command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+        troot="$out/tlslocal"
+        rm -rf "$troot"; mkdir -p "$troot"
+        openssl req -x509 -newkey rsa:2048 -keyout "$troot/key.pem" \
+            -out "$troot/cert.pem" -days 2 -nodes -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost" 2>/dev/null || true
+        cat > "$troot/srv.py" <<'PYEOF'
+import socket, ssl, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[3], sys.argv[4])
+ctx.set_ciphers(sys.argv[5])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', int(sys.argv[1])))
+s.listen(1)
+s.settimeout(25)
+c, _ = s.accept()
+t = ctx.wrap_socket(c, server_side=True)
+body = b'local-tls-ok'
+t.recv(2048)
+t.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n' + body)
+t.close()
+s.close()
+PYEOF
+        tls_probe() {
+            python3 "$troot/srv.py" "$1" x "$troot/cert.pem" "$troot/key.pem" "$2" \
+                >/dev/null 2>&1 &
+            srv=$!
+            sleep 2
+            r=$("$MYOS" "$out/fetch" "https://localhost:$1/" 2>/dev/null); rc=$?
+            kill $srv 2>/dev/null
+            [[ "$r" == *"200 OK"* ]] && [ "$rc" -eq 0 ]
+        }
+        if tls_probe 18721 ECDHE-RSA-AES128-GCM-SHA256; then
+            ok "TLS negotiates ECDHE+GCM against a modern-only server"
+        else
+            bad "tls ECDHE-only: rc=$rc out=$r"
+        fi
+        if tls_probe 18722 AES128-SHA; then
+            ok "TLS falls back to RSA+CBC against a legacy-only server"
+        else
+            bad "tls CBC-only: rc=$rc out=$r"
+        fi
+    else
+        echo "skip local TLS checks (need built fetch + openssl + python3)"
+    fi
 else
     echo "skip myos end-to-end checks ($MYOS not built)"
 fi

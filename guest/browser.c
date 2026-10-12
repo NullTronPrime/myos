@@ -1,8 +1,9 @@
 /* browser: a minimal graphical web browser for myos.
  *
  * One window: a URL bar on top, the page below, a status line at the
- * bottom. HTTP/1.0 over the guest socket layer, tag-stripping HTML with
- * clickable links, scrollback-free scrolling viewport, and a back history.
+ * bottom. HTTP/1.1 over the guest socket layer (chunked bodies decoded),
+ * tag-stripping HTML with clickable links, scrollback-free scrolling
+ * viewport, and a back history.
  *
  * Controls:
  *   type             edit the URL bar
@@ -48,7 +49,12 @@
 
 #define CHAR_W 8
 #define CHAR_H 8
-#define BAR_H 24
+/* Title strip (drag handle + close), then nav row + bookmarks row. */
+#define TITLE_H 18
+#define NAV_H 24
+#define BM_H 16
+#define BAR_H (NAV_H + BM_H)
+#define CHROME_H (TITLE_H + BAR_H)
 #define STATUS_H 16
 #define URL_CAP 512
 #define BODY_CAP (256 * 1024)
@@ -87,7 +93,9 @@ struct input_event {
 #define MOD_CTRL 2
 #define EV_MOUSEDOWN 3
 #define EV_MOUSEUP 4
+#define EV_MOUSEMOVE 5
 #define EV_CLOSE 8
+#define EV_RESIZE 9
 /* Keysyms. */
 #define KEY_RETURN 0xff0d
 #define KEY_BS 0xff08
@@ -136,6 +144,14 @@ static int nscripts = 0; /* <script> blocks on the page (not executed) */
 
 static char hist[MAX_HIST][URL_CAP];
 static int nhist = 0;
+/* Last response's status line + Location header (for redirects). */
+static char http_status[128];
+static char http_location[URL_CAP];
+static char fwd[MAX_HIST][URL_CAP];
+static int nfwd = 0;
+/* Starred pages, shown on the bookmarks bar (max 3, in-memory). */
+static char marks[3][URL_CAP];
+static int nmarks = 0;
 
 static char status[URL_CAP];
 
@@ -216,6 +232,27 @@ static void resolve_url(const char *base, const char *href, char *out, size_t ou
 
 /* Fetch failures go to the status line and to stderr: headless runs
  * cannot read pixels, so the log is the only observable. */
+/* Decodes chunked transfer encoding in place; returns the decoded length.
+ * A truncated tail keeps what decoded so far (matches the truncated-close
+ * tolerance in fetch_page). */
+static size_t dechunk(char *b, size_t n) {
+    size_t ri = 0, wi = 0;
+    while (ri < n) {
+        char *e = memchr(b + ri, '\n', n - ri);
+        if (!e) break;
+        unsigned long sz = strtoul(b + ri, NULL, 16);
+        ri = (size_t)(e + 1 - b);
+        if (sz == 0) break;
+        if (ri + sz > n) break;
+        memmove(b + wi, b + ri, sz);
+        wi += sz;
+        ri += sz;
+        if (ri + 2 <= n && b[ri] == '\r' && b[ri + 1] == '\n') ri += 2;
+        else if (ri < n && b[ri] == '\n') ri += 1;
+    }
+    return wi;
+}
+
 static void fetch_fail(const char *msg) {
     snprintf(status, sizeof(status), "%s", msg);
     fprintf(stderr, "browser: fetch %s\n", msg);
@@ -243,23 +280,11 @@ static int fetch_page(const char *url) {
         fetch_fail("bad port");
         return -1;
     }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr = addr;
-    sa.sin_port = (unsigned short)(((pnum & 0xff) << 8) | ((pnum >> 8) & 0xff));
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = tcp_connect_timeout(&addr, pnum, 10000);
     if (fd < 0) {
-        char msg[300];
-        snprintf(msg, sizeof(msg), "socket: %s", strerror(errno));
-        fetch_fail(msg);
-        return -1;
-    }
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         char msg[300];
         snprintf(msg, sizeof(msg), "connect: %s", strerror(errno));
         fetch_fail(msg);
-        close(fd);
         return -1;
     }
     struct tls_ctx tls;
@@ -282,7 +307,7 @@ static int fetch_page(const char *url) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
              path, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -323,10 +348,61 @@ static int fetch_page(const char *url) {
         return -1;
     }
     body[body_len] = '\0';
+    /* Stash the status line + Location BEFORE the headers are stripped,
+     * so navigate() can follow redirects. */
+    {
+        http_status[0] = '\0';
+        http_location[0] = '\0';
+        size_t fl = strcspn(body, "\r\n");
+        if (fl > sizeof(http_status) - 1) fl = sizeof(http_status) - 1;
+        memcpy(http_status, body, fl);
+        http_status[fl] = '\0';
+        const char *hend = strstr(body, "\r\n\r\n");
+        size_t hlen = hend ? (size_t)(hend - body) : body_len;
+        const char *p = body;
+        while (p < body + hlen) {
+            const char *eol = strstr(p, "\r\n");
+            if (!eol || eol > body + hlen) eol = body + hlen;
+            if ((size_t)(eol - p) > 9 && strncasecmp(p, "location:", 9) == 0) {
+                const char *v = p + 9;
+                while (v < eol && (*v == ' ' || *v == '\t')) v++;
+                size_t vlen = (size_t)(eol - v);
+                while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t'))
+                    vlen--;
+                if (vlen > 0 && vlen < sizeof(http_location)) {
+                    memcpy(http_location, v, vlen);
+                    http_location[vlen] = '\0';
+                }
+            }
+            p = (*eol == '\r') ? eol + 2 : eol;
+            if (p >= body + hlen) break;
+        }
+    }
+    /* Split off the response headers; decode chunked bodies, which HTTP/1.1
+     * servers use for dynamic pages (search results). */
+    char *sep = strstr(body, "\r\n\r\n");
+    if (sep) {
+        char save = *sep;
+        *sep = '\0';
+        int chunked = strcasestr(body, "transfer-encoding") &&
+                      strcasestr(body, "chunked");
+        *sep = save;
+        size_t boff = (size_t)(sep + 4 - body);
+        if (chunked) {
+            body_len = dechunk(body + boff, body_len - boff);
+            memmove(body, body + boff, body_len);
+        } else {
+            memmove(body, body + boff, body_len - boff);
+            body_len -= boff;
+        }
+        body[body_len] = '\0';
+    }
     snprintf(cur_host, sizeof(cur_host), "%s", host);
     snprintf(cur_port, sizeof(cur_port), "%s", port);
     return 0;
 }
+
+
 
 /* ---------------- HTML to lines ---------------- */
 
@@ -578,6 +654,64 @@ static void push_hist(const char *url) {
     snprintf(hist[nhist++], URL_CAP, "%s", url);
 }
 
+/* Chunk-framing state for a streamed download. */
+struct unchunk {
+    int active;          /* transfer-encoding is chunked */
+    int done;            /* terminal zero chunk seen */
+    unsigned long left;  /* body bytes remaining in this chunk */
+    int need_size;       /* next bytes are a chunk-size line */
+    char line[32];       /* partial size line */
+    size_t llen;
+};
+
+/* Writes all of b or returns -1. */
+static int write_all(int fd, const char *b, size_t n) {
+    while (n > 0) {
+        ssize_t w = write(fd, b, n);
+        if (w <= 0) return -1;
+        b += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Feeds wire bytes through the chunk framing, writing de-framed body bytes
+ * to `out` and counting them in *total. Returns 0 normally, 1 when the
+ * terminal chunk arrived (stop reading), -1 on write error. */
+static int unchunk_feed(struct unchunk *u, int out, const char *b, size_t n, long *total) {
+    if (!u->active) {
+        if (write_all(out, b, n) < 0) return -1;
+        *total += (long)n;
+        return 0;
+    }
+    size_t i = 0;
+    while (i < n && !u->done) {
+        if (u->need_size) {
+            char c = b[i++];
+            if (c == '\n') {
+                u->line[u->llen] = '\0';
+                u->left = strtoul(u->line, NULL, 16);
+                u->llen = 0;
+                u->need_size = 0;
+                if (u->left == 0) u->done = 1;
+            } else if (c != '\r' && u->llen + 1 < sizeof(u->line)) {
+                u->line[u->llen++] = c;
+            }
+        } else if (u->left > 0) {
+            size_t run = n - i;
+            if (run > u->left) run = (size_t)u->left;
+            if (write_all(out, b + i, run) < 0) return -1;
+            *total += (long)run;
+            i += run;
+            u->left -= (unsigned long)run;
+        } else {
+            /* End of chunk data: consume one CRLF, then a size line. */
+            if (b[i++] == '\n') u->need_size = 1;
+        }
+    }
+    return u->done ? 1 : 0;
+}
+
 /* Streams a URL body straight to a file: pages buffer in memory for
  * rendering, but app binaries can exceed that. Returns bytes written or
  * -1 with status set. */
@@ -590,17 +724,8 @@ static long stream_to_file(const char *url, const char *path) {
     if (resolve_host(host, &addr) < 0) return -1;
     int pnum = atoi(port);
     if (pnum <= 0 || pnum > 65535) return -1;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr = addr;
-    sa.sin_port = (unsigned short)(((pnum & 0xff) << 8) | ((pnum >> 8) & 0xff));
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = tcp_connect_timeout(&addr, pnum, 10000);
     if (fd < 0) return -1;
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        return -1;
-    }
     struct tls_ctx tls;
     memset(&tls, 0, sizeof(tls));
     if (secure) {
@@ -612,7 +737,7 @@ static long stream_to_file(const char *url, const char *path) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: myos-browser\r\nConnection: close\r\n\r\n",
              upath, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -652,30 +777,40 @@ static long stream_to_file(const char *url, const char *path) {
         close(fd);
         return -1;
     }
+    /* Chunked bodies must be de-framed or the saved binary corrupts. */
+    struct unchunk u;
+    memset(&u, 0, sizeof(u));
+    {
+        char save = *sep;
+        *sep = '\0';
+        u.active = strcasestr(hdr, "transfer-encoding") && strcasestr(hdr, "chunked");
+        *sep = save;
+        u.need_size = u.active;
+    }
     long total = 0;
+    int feed = 0;
     /* Leftover body bytes already read past the headers. */
     if (hlen > hoff) {
-        size_t extra = hlen - hoff;
-        if (write(out, hdr + hoff, extra) != (ssize_t)extra) {
+        feed = unchunk_feed(&u, out, hdr + hoff, hlen - hoff, &total);
+        if (feed < 0) {
             close(out);
             tls_free(&tls);
             close(fd);
             return -1;
         }
-        total += (long)extra;
     }
     char buf[8192];
-    for (;;) {
+    while (!feed) {
         n = secure ? tls_read(&tls, buf, sizeof(buf)) : recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
-        size_t off = 0;
-        while (off < (size_t)n) {
-            ssize_t w = write(out, buf + off, (size_t)n - off);
-            if (w <= 0) break;
-            off += (size_t)w;
-        }
-        if (off != (size_t)n) break;
-        total += n;
+        feed = unchunk_feed(&u, out, buf, (size_t)n, &total);
+        if (feed < 0) break;
+    }
+    if (feed < 0) {
+        close(out);
+        tls_free(&tls);
+        close(fd);
+        return -1;
     }
     close(out);
     tls_free(&tls);
@@ -733,8 +868,34 @@ static int url_is_binary(const char *url) {
     return n > 4 && strcmp(url + n - 4, ".bin") == 0;
 }
 
+/* If the last response was a redirect, returns a malloc'd absolute URL
+ * for the Location target, or NULL. Only 3xx with an http(s) or relative
+ * Location is followed. */
+static char *redirect_location(const char *base) {
+    const char *sp = strchr(http_status, ' ');
+    if (!sp || sp[1] != '3' || sp[2] < '0' || sp[2] > '9') return NULL;
+    if (!http_location[0]) return NULL;
+    char *out = malloc(URL_CAP);
+    if (!out) return NULL;
+    resolve_url(base, http_location, out, URL_CAP);
+    return out;
+}
+
 static void navigate(const char *url, int record) {
     char full[URL_CAP];
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        /* What users type: a bare hostname goes to https, a single
+         * word becomes a web search. */
+        if (!strchr(url, ' ') && !strchr(url, '/')) {
+            char with[URL_CAP];
+            if (strchr(url, '.'))
+                snprintf(with, sizeof(with), "https://%s", url);
+            else
+                snprintf(with, sizeof(with), "https://wiby.me/?q=%s", url);
+            navigate(with, record);
+            return;
+        }
+    }
     if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
         snprintf(full, sizeof(full), "%s", url);
     } else {
@@ -748,12 +909,29 @@ static void navigate(const char *url, int record) {
                      cur_port[0] ? cur_port : "80");
         resolve_url(base, url, full, sizeof(full));
     }
-    if (record && urlbar[0]) push_hist(urlbar);
+    if (record && urlbar[0]) {
+        push_hist(urlbar);
+        nfwd = 0; /* a new navigation forgets the forward trail */
+    }
     fprintf(stderr, "browser: -> %s\n", full);
     snprintf(urlbar, sizeof(urlbar), "%s", full);
     url_len = (int)strlen(urlbar);
-    /* Split headers from body for rendering. */
-    if (fetch_page(full) == 0) {
+    /* Follow redirects (google.com -> www.google.com): re-fetch against
+     * the Location URL, same-method GET, bounded hops. */
+    int fetched = 0;
+    for (int hops = 0; hops < 5; hops++) {
+        if (fetch_page(full) != 0) return;
+        fetched = 1;
+        char *loc = redirect_location(full);
+        if (!loc) break;
+        fprintf(stderr, "browser: redirect -> %s\n", loc);
+        snprintf(full, sizeof(full), "%s", loc);
+        free(loc);
+        snprintf(urlbar, sizeof(urlbar), "%s", full);
+        url_len = (int)strlen(urlbar);
+    }
+    /* Split headers from body for rendering (body holds the final hop). */
+    if (fetched) {
         const char *sep = strstr(body, "\r\n\r\n");
         /* Binary payloads (octet-stream or .bin links) download and run
          * instead of rendering. */
@@ -773,37 +951,136 @@ static void navigate(const char *url, int record) {
             return;
         }
         const char *html = sep ? sep + 4 : body;
-        /* status line into the window title area */
-        char first[128] = {0};
-        size_t fl = strcspn(body, "\r\n");
-        if (fl > sizeof(first) - 1) fl = sizeof(first) - 1;
-        memcpy(first, body, fl);
-        snprintf(status, sizeof(status), "%s", first);
+        /* Status line into the window title area (from the stashed
+         * headers: body no longer carries them). */
+        snprintf(status, sizeof(status), "%s", http_status);
         layout_html(html);
     }
 }
 
 /* ---------------- rendering ---------------- */
 
+/* Bookmarks-row label origins, recorded while drawing so clicks map. */
+static int mark_x[3];
+
+/* Fill a rect in the window buffer, clipped. */
+static void bar_rect(int x0, int y0, int bw, int bh, unsigned int color) {
+    unsigned int *pp = (unsigned int *)win_buf;
+    for (int y = y0; y < y0 + bh; y++) {
+        if (y < 0 || y >= (int)win_h) continue;
+        for (int x = x0; x < x0 + bw; x++) {
+            if (x < 0 || x >= (int)win_w) continue;
+            pp[y * win_w + x] = color;
+        }
+    }
+}
+
+/* 1px outline with cut corners (radius 3), Brave-pill style. */
+static void pill_outline(int x0, int y0, int bw, int bh, unsigned int color) {
+    unsigned int *pp = (unsigned int *)win_buf;
+    for (int x = x0 + 3; x < x0 + bw - 3; x++) {
+        if (x < 0 || x >= (int)win_w) continue;
+        if (y0 >= 0 && y0 < (int)win_h) pp[y0 * win_w + x] = color;
+        if (y0 + bh - 1 >= 0 && y0 + bh - 1 < (int)win_h)
+            pp[(y0 + bh - 1) * win_w + x] = color;
+    }
+    for (int y = y0 + 3; y < y0 + bh - 3; y++) {
+        if (y < 0 || y >= (int)win_h) continue;
+        if (x0 >= 0 && x0 < (int)win_w) pp[y * win_w + x0] = color;
+        if (x0 + bw - 1 >= 0 && x0 + bw - 1 < (int)win_w)
+            pp[y * win_w + x0 + bw - 1] = color;
+    }
+}
+
+/* Drag state for the title strip (window-relative grab point + tracked
+ * outer position, since events arrive in window coordinates). */
+static int dragging = 0;
+static int grab_x = 0, grab_y = 0;
+static int own_x = 0, own_y = 0;
+
 static void draw_bar(void) {
     unsigned int *px = (unsigned int *)win_buf;
-    for (unsigned y = 0; y < BAR_H && y < win_h; y++)
+    /* Title strip: drag handle + close box. */
+    for (unsigned y = 0; y < TITLE_H && y < win_h; y++)
+        for (unsigned x = 0; x < win_w; x++)
+            px[y * win_w + x] = 0x003A3D4D;
+    {
+        char title[128];
+        snprintf(title, sizeof(title), "browser - %s",
+                 urlbar[0] ? urlbar : "(blank)");
+        title[(win_w - 60) / CHAR_W > 0 ? (win_w - 60) / CHAR_W : 0] = '\0';
+        syscall(SYS_WINDOW_DRAW_TEXT, win, 8, 5, FG_BAR, 0x003A3D4D, title);
+        syscall(SYS_WINDOW_DRAW_TEXT, win, (int)win_w - 20, 5, FG_BAR,
+                0x003A3D4D, "X");
+    }
+    int top = TITLE_H;
+    for (unsigned y = top; y < top + BAR_H && y < win_h; y++)
         for (unsigned x = 0; x < win_w; x++)
             px[y * win_w + x] = BG_BAR;
-    char prompt[URL_CAP + 8];
-    snprintf(prompt, sizeof(prompt), "URL: %s", urlbar);
-    prompt[win_w / CHAR_W > 5 ? win_w / CHAR_W - 5 : 0] = '\0';
-    syscall(SYS_WINDOW_DRAW_TEXT, win, 4, 8, FG_BAR, BG_BAR, prompt);
-    /* cursor */
+    /* Nav buttons: back fwd reload home. Dim when they would do nothing. */
+    syscall(SYS_WINDOW_DRAW_TEXT, win, 6, top + 8, nhist ? FG_BAR : FG_DIM, BG_BAR, "<");
+    syscall(SYS_WINDOW_DRAW_TEXT, win, 24, top + 8, nfwd ? FG_BAR : FG_DIM, BG_BAR, ">");
+    syscall(SYS_WINDOW_DRAW_TEXT, win, 42, top + 8, FG_BAR, BG_BAR, "R");
+    syscall(SYS_WINDOW_DRAW_TEXT, win, 60, top + 8, FG_BAR, BG_BAR, "H");
+    /* Star at the right edge. */
     {
-        int cx = 4 + (int)(strlen("URL: ") + (size_t)url_len) * CHAR_W;
-        unsigned int *pp = (unsigned int *)win_buf;
-        for (int dy = 0; dy < CHAR_H && 8 + dy < (int)BAR_H; dy++)
-            for (int dx = 0; dx < 2; dx++) {
-                int sx = cx + dx, sy = 8 + dy;
-                if (sx >= 0 && sx < (int)win_w && sy >= 0 && sy < (int)win_h)
-                    pp[sy * win_w + sx] = FG_BAR;
+        char star[2] = {'*', '\0'};
+        syscall(SYS_WINDOW_DRAW_TEXT, win, (int)win_w - 22, top + 8, FG_BAR, BG_BAR, star);
+    }
+    /* URL pill: blurple outline, dark fill, lion tile + text. */
+    int pill_x = 84, pill_y = top + 3, pill_w = (int)win_w - pill_x - 30, pill_h = 18;
+    if (pill_w > 40) {
+        bar_rect(pill_x, pill_y, pill_w, pill_h, 0x001E2029);
+        pill_outline(pill_x, pill_y, pill_w, pill_h, 0x004C54D2);
+        /* Lion tile: brave-orange block with a white B. */
+        bar_rect(pill_x + 4, pill_y + 2, 14, 14, 0x00FB542B);
+        syscall(SYS_WINDOW_DRAW_TEXT, win, pill_x + 7, pill_y + 4,
+                0x00FFFFFF, 0xffffffffL, "B");
+        char shown[URL_CAP];
+        snprintf(shown, sizeof(shown), "%s", urlbar);
+        int maxc = (pill_w - 28) / CHAR_W;
+        if (maxc < 0) maxc = 0;
+        if ((int)strlen(shown) > maxc) shown[maxc] = '\0';
+        syscall(SYS_WINDOW_DRAW_TEXT, win, pill_x + 24, pill_y + 5,
+                FG_BAR, 0x001E2029, shown);
+        /* cursor */
+        {
+            int cx = pill_x + 24 + url_len * CHAR_W;
+            if (cx < pill_x + pill_w - 4) {
+                for (int dy = 0; dy < CHAR_H; dy++)
+                    for (int dx = 0; dx < 2; dx++) {
+                        int sx = cx + dx, sy = pill_y + 5 + dy;
+                        if (sx >= 0 && sx < (int)win_w && sy >= 0 && sy < (int)win_h)
+                            px[sy * win_w + sx] = FG_BAR;
+                    }
             }
+        }
+    }
+    /* Bookmarks bar: grid glyph + placeholder or saved marks. */
+    int bmy = top + NAV_H;
+    bar_rect(0, bmy, (int)win_w, BM_H, 0x00282A36);
+    bar_rect(6, bmy + 4, 4, 4, 0x00BBBBBB);
+    bar_rect(12, bmy + 4, 4, 4, 0x00BBBBBB);
+    bar_rect(6, bmy + 10, 4, 4, 0x00BBBBBB);
+    bar_rect(12, bmy + 10, 4, 4, 0x00BBBBBB);
+    if (nmarks == 0) {
+        syscall(SYS_WINDOW_DRAW_TEXT, win, 26, bmy + 4, FG_DIM, 0x00282A36,
+                "For quick access, place your bookmarks here.");
+    } else {
+        int mx = 90;
+        for (int i = 0; i < nmarks; i++) {
+            char host[64], port[16], path[URL_CAP], hshow[40];
+            int sec = 0;
+            mark_x[i] = mx;
+            if (parse_url(marks[i], host, sizeof(host), port, sizeof(port),
+                          path, sizeof(path), &sec) == 0)
+                snprintf(hshow, sizeof(hshow), "%.36s", host);
+            else
+                snprintf(hshow, sizeof(hshow), "%.36s", marks[i]);
+            syscall(SYS_WINDOW_DRAW_TEXT, win, mx, bmy + 4, FG_LINK,
+                    0x00282A36, hshow);
+            mx += (int)strlen(hshow) * CHAR_W + 24;
+        }
     }
 }
 
@@ -812,7 +1089,7 @@ static void render(void) {
     unsigned int *px = (unsigned int *)win_buf;
     for (unsigned i = 0; i < win_w * win_h; i++) px[i] = BG_MAIN;
     /* Page rows as per-run colored text; links in link color. */
-    int rows = ((int)win_h - BAR_H - STATUS_H) / CHAR_H;
+    int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
     char run[LINE_COLS + 1];
     for (int r = 0; r < rows; r++) {
         int lr = scroll + r;
@@ -820,7 +1097,7 @@ static void render(void) {
         const char *t = lines[lr].text;
         if (!t[0]) continue;
         if (lines[lr].nrun == 0) {
-            syscall(SYS_WINDOW_DRAW_TEXT, win, 0, BAR_H + r * CHAR_H,
+            syscall(SYS_WINDOW_DRAW_TEXT, win, 0, CHROME_H + r * CHAR_H,
                     FG_TEXT, BG_MAIN, t);
             continue;
         }
@@ -835,7 +1112,7 @@ static void render(void) {
             if (n > (int)sizeof(run) - 1) n = (int)sizeof(run) - 1;
             memcpy(run, t + c0, (size_t)n);
             run[n] = '\0';
-            syscall(SYS_WINDOW_DRAW_TEXT, win, c0 * CHAR_W, BAR_H + r * CHAR_H,
+            syscall(SYS_WINDOW_DRAW_TEXT, win, c0 * CHAR_W, CHROME_H + r * CHAR_H,
                     li >= 0 ? FG_LINK : FG_TEXT, BG_MAIN, run);
         }
     }
@@ -872,8 +1149,8 @@ static void present(void) {
 
 /* Click at page coords: follow a link if one covers the cell. */
 static void click_page(int px, int py) {
-    int rows = ((int)win_h - BAR_H - STATUS_H) / CHAR_H;
-    int r = (py - BAR_H) / CHAR_H;
+    int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
+    int r = (py - CHROME_H) / CHAR_H;
     int c = px / CHAR_W;
     if (r < 0 || r >= rows) return;
     int lr = scroll + r;
@@ -891,8 +1168,17 @@ static void click_page(int px, int py) {
     }
 }
 
+static void push_fwd(const char *url) {
+    if (nfwd >= MAX_HIST) {
+        memmove(fwd[0], fwd[1], sizeof(fwd[0]) * (MAX_HIST - 1));
+        nfwd = MAX_HIST - 1;
+    }
+    snprintf(fwd[nfwd++], URL_CAP, "%s", url);
+}
+
 static void go_back(void) {
     if (nhist == 0) return;
+    if (urlbar[0]) push_fwd(urlbar);
     char prev[URL_CAP];
     snprintf(prev, sizeof(prev), "%s", hist[--nhist]);
     snprintf(urlbar, sizeof(urlbar), "%s", prev);
@@ -904,22 +1190,75 @@ static void go_back(void) {
     present();
 }
 
+static void go_forward(void) {
+    if (nfwd == 0) return;
+    if (urlbar[0]) push_hist(urlbar);
+    char next[URL_CAP];
+    snprintf(next, sizeof(next), "%s", fwd[--nfwd]);
+    snprintf(urlbar, sizeof(urlbar), "%s", next);
+    url_len = (int)strlen(urlbar);
+    if (fetch_page(next) == 0) {
+        const char *sep = strstr(body, "\r\n\r\n");
+        layout_html(sep ? sep + 4 : body);
+    }
+    present();
+}
+
+static void go_home(void) {
+    navigate("https://wiby.me/", 1);
+    present();
+}
+
+static void reload(void) {
+    if (!urlbar[0]) return;
+    navigate(urlbar, 0);
+    present();
+}
+
+/* Star button: remember the current page on the bookmarks bar. */
+static void toggle_mark(void) {
+    if (!urlbar[0]) return;
+    for (int i = 0; i < nmarks; i++) {
+        if (strcmp(marks[i], urlbar) == 0) {
+            snprintf(status, sizeof(status), "already bookmarked");
+            present();
+            return;
+        }
+    }
+    if (nmarks >= 3) {
+        snprintf(status, sizeof(status), "bookmarks bar is full (3)");
+        present();
+        return;
+    }
+    snprintf(marks[nmarks++], URL_CAP, "%s", urlbar);
+    snprintf(status, sizeof(status), "bookmarked");
+    present();
+}
+
+/* (Re)builds the window for a WxH frame: startup and host resizes. */
+static int build_window(unsigned w, unsigned h) {
+    if (w < 200 || h < 120 || w > 2048 || h > 2048) return -1;
+    if (win >= 0) syscall(SYS_WINDOW_DESTROY, win, 0, 0, 0, 0, 0);
+    win_w = w > 640 ? 640 : w;
+    win_h = h > 480 ? 480 : h;
+    win = (int)syscall(SYS_WINDOW_CREATE, win_w, win_h, 0, 0, 0, 0);
+    if (win < 0) return -1;
+    struct window_info wi;
+    win_buf = (unsigned long)syscall(SYS_WINDOW_MAP, win, &wi, 0, 0, 0, 0);
+    if (win_buf == 0) return -1;
+    win_w = wi.width;
+    win_h = wi.height;
+    syscall(SYS_WINDOW_SET_TITLE, win, "browser", 0, 0, 0, 0);
+    syscall(SYS_WINDOW_FOCUS, win, 0, 0, 0, 0, 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct display_info di;
     if ((long)syscall(SYS_DISPLAY_INFO, &di, 0, 0, 0, 0, 0) < 0) return die("display_info");
     if (di.width == 0 || di.height == 0) return 1;
 
-    win_w = di.width > 640 ? 640 : di.width;
-    win_h = di.height > 480 ? 480 : di.height;
-    win = (int)syscall(SYS_WINDOW_CREATE, win_w, win_h, 0, 0, 0, 0);
-    if (win < 0) return die("window_create");
-    struct window_info wi;
-    win_buf = (unsigned long)syscall(SYS_WINDOW_MAP, win, &wi, 0, 0, 0, 0);
-    if (win_buf == 0) return die("window_map");
-    win_w = wi.width;
-    win_h = wi.height;
-    syscall(SYS_WINDOW_SET_TITLE, win, "browser", 0, 0, 0, 0);
-    syscall(SYS_WINDOW_FOCUS, win, 0, 0, 0, 0, 0);
+    if (build_window(di.width, di.height) < 0) return die("window_create");
 
     mkdir("/winserv", 0755);
     mkdir("/winserv/clients", 0755);
@@ -940,12 +1279,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "browser: start %s\n", start);
     snprintf(urlbar, sizeof(urlbar), "%s", start);
     url_len = (int)strlen(urlbar);
-    if (fetch_page(start) == 0) {
-        const char *sep = strstr(body, "\r\n\r\n");
-        layout_html(sep ? sep + 4 : body);
-    } else {
+    /* Through navigate so redirects resolve the same way as typed URLs. */
+    navigate(start, 0);
+    if (nlines == 0)
         layout_html("<html><body><p>Type a URL above and press Return.</p></body></html>");
-    }
     present();
 
     struct pollfd pfd = { .fd = input_fd, .events = POLLIN };
@@ -959,9 +1296,68 @@ int main(int argc, char **argv) {
             ssize_t n = read(input_fd, &ev, sizeof(ev));
             if (n != (ssize_t)sizeof(ev)) continue;
             if (ev.kind == EV_CLOSE) break;
+            if (ev.kind == EV_RESIZE) {
+                /* Host resized the window: rebuild the buffer and
+                 * re-render the current page into it. */
+                if (build_window(ev.width, ev.height) == 0) {
+                    int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
+                    int max = nlines - rows;
+                    if (max < 0) max = 0;
+                    if (scroll > max) scroll = max;
+                    present();
+                }
+                continue;
+            }
+            if (ev.kind == EV_MOUSEUP && ev.button == 1 && dragging) {
+                dragging = 0;
+                continue;
+            }
+            if (ev.kind == EV_MOUSEMOVE && dragging) {
+                int nx = own_x + ev.x - grab_x;
+                int ny = own_y + ev.y - grab_y;
+                if (syscall(SYS_WINDOW_MOVE, win, nx, ny, 0, 0, 0, 0) == 0) {
+                    own_x = nx;
+                    own_y = ny;
+                }
+                continue;
+            }
             if (ev.kind == EV_MOUSEDOWN && ev.button == 1) {
-                if (ev.y < BAR_H) {
-                    /* URL bar takes focus; nothing else to do. */
+                if (ev.y < TITLE_H) {
+                    /* Title strip: close box or drag handle. */
+                    if (ev.x >= (int)win_w - 24) {
+                        break;
+                    }
+                    dragging = 1;
+                    grab_x = ev.x;
+                    grab_y = ev.y;
+                } else if (ev.y < TITLE_H + NAV_H) {
+                    /* Nav row: back fwd reload home ... star. */
+                    if (ev.x < 21) go_back();
+                    else if (ev.x < 41) go_forward();
+                    else if (ev.x < 61) reload();
+                    else if (ev.x < 81) go_home();
+                    else if (ev.x >= (int)win_w - 28) toggle_mark();
+                    /* Elsewhere on the row is the URL pill: typing
+                     * already goes there, so focus needs no action. */
+                } else if (ev.y < CHROME_H) {
+                    /* Bookmarks row: follow a saved mark. */
+                    for (int i = 0; i < nmarks; i++) {
+                        char host[64], port[16], path[URL_CAP], hshow[40];
+                        int sec = 0;
+                        if (parse_url(marks[i], host, sizeof(host), port,
+                                      sizeof(port), path, sizeof(path),
+                                      &sec) == 0)
+                            snprintf(hshow, sizeof(hshow), "%.36s", host);
+                        else
+                            snprintf(hshow, sizeof(hshow), "%.36s", marks[i]);
+                        int x0 = mark_x[i];
+                        int x1 = x0 + (int)strlen(hshow) * CHAR_W;
+                        if (ev.x >= x0 && ev.x < x1) {
+                            navigate(marks[i], 1);
+                            present();
+                            break;
+                        }
+                    }
                 } else {
                     click_page(ev.x, ev.y);
                 }
@@ -990,14 +1386,14 @@ int main(int argc, char **argv) {
                     go_back();
                 }
             } else if (k == KEY_NEXT) {
-                int rows = ((int)win_h - BAR_H - STATUS_H) / CHAR_H;
+                int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
                 scroll += rows - 1;
                 int max = nlines - rows;
                 if (max < 0) max = 0;
                 if (scroll > max) scroll = max;
                 present();
             } else if (k == KEY_PRIOR) {
-                int rows = ((int)win_h - BAR_H - STATUS_H) / CHAR_H;
+                int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
                 scroll -= rows - 1;
                 if (scroll < 0) scroll = 0;
                 present();
@@ -1005,12 +1401,14 @@ int main(int argc, char **argv) {
                 /* Up/Down share one keysym on this host mapping, so both
                  * arrows scroll by a line. */
                 scroll += 1;
-                int rows = ((int)win_h - BAR_H - STATUS_H) / CHAR_H;
+                int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
                 int max = nlines - rows;
                 if (max < 0) max = 0;
                 if (scroll > max) scroll = max;
                 present();
-            } else if (k >= 0x20 && k < 0x7f && !ev.mods) {
+            } else if (k >= 0x20 && k < 0x7f && !(ev.mods & ~1)) {
+                /* Shift is consumed into the keysym above; ctrl/alt
+                 * combos stay reserved for shortcuts. */
                 if (url_len + 1 < (int)sizeof(urlbar)) {
                     urlbar[url_len++] = (char)k;
                     urlbar[url_len] = '\0';

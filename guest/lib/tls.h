@@ -1,11 +1,12 @@
 /* tls: a minimal TLS 1.2 client for myos guests (guest/lib/tls.c).
  *
- * Speaks exactly one suite, TLS_RSA_WITH_AES_128_CBC_SHA, against servers
- * that offer it. Static-link friendly: only read/write/open/close, malloc
- * and time from libc; entropy from /dev/urandom (bridged read-only).
+ * Offers TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 first, falling back to
+ * TLS_RSA_WITH_AES_128_CBC_SHA. Static-link friendly: only
+ * read/write/open/close, malloc and time from libc; entropy from
+ * /dev/urandom (bridged read-only).
  *
- * Toy-grade on purpose: RSA key exchange only (no forward secrecy), CBC
- * with SHA-1 MACs (no AEAD), certificate hostname/expiry checks but NO
+ * Toy-grade on purpose: RSA certificates only (ECDSA chains fail), no
+ * session resumption, certificate hostname/expiry checks but NO
  * chain-of-trust validation (there is nowhere to store trust anchors
  * yet). Enough to fetch real pages where the OS has connectivity; not a
  * general trust story. See the header of tls.c for the full accounting.
@@ -20,10 +21,17 @@ struct tls_ctx {
     int fd;
     unsigned long long read_seq;
     unsigned long long write_seq;
+    /* Negotiated suite: 0x002f (CBC) or 0xc02f (GCM). */
+    int suite;
     unsigned char client_mac[20];
     unsigned char server_mac[20];
     unsigned char client_key[16];
     unsigned char server_key[16];
+    /* GCM traffic keys + salts (suite 0xc02f only). */
+    unsigned char cwkey[16];
+    unsigned char swkey[16];
+    unsigned char cwiv[4];
+    unsigned char swiv[4];
     /* Leftover decrypted application bytes. */
     unsigned char *pending;
     size_t pending_len;
