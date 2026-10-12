@@ -358,6 +358,44 @@ PYEOF
     else
         echo "skip local TLS checks (need built fetch + openssl + python3)"
     fi
+
+    # 23. QuickJS under the trap: arithmetic, closures, JSON, print,
+    #     exceptions and exit codes, all through the static guest build.
+    "$cc" -static -no-pie -O2 -fno-stack-protector '-DCONFIG_VERSION="2026-06-04"' \
+        -o "$out/js" js.c ../third_party/quickjs/quickjs.c \
+        ../third_party/quickjs/dtoa.c ../third_party/quickjs/libregexp.c \
+        ../third_party/quickjs/libunicode.c ../third_party/quickjs/cutils.c -lm || exit 1
+    r=$("$MYOS" "$out/js" -e '[1,2,3].map(x => x * 2).join("-")' 2>/dev/null); rc=$?
+    if [ "$r" = "2-4-6" ] && [ "$rc" -eq 0 ]; then
+        ok "QuickJS evaluates closures under myos"
+    else
+        bad "js eval: rc=$rc out=$r"
+    fi
+    r=$("$MYOS" "$out/js" -e 'throw new Error("x")' 2>/dev/null); rc=$?
+    [ "$rc" -eq 1 ] && ok "JS exceptions propagate as exit 1" \
+        || bad "js throw: rc=$rc out=$r"
+
+    # 24. HTML tree: nesting, attributes, void elements, raw script text,
+    #     id lookup and script collection, all under myos.
+    "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/dom_test" dom_test.c lib/dom.c || exit 1
+    r=$("$MYOS" "$out/dom_test" 2>/dev/null); rc=$?
+    if has "DOM_TEST:PASS" "$r" && has "by_id main: div" "$r" && [ "$rc" -eq 0 ]; then
+        ok "HTML parser builds a queryable tree under myos"
+    else
+        bad "dom_test: rc=$rc out=$r"
+    fi
+
+    # 25. DOM bindings: getElementById, querySelectorAll, createElement,
+    #     timers and the full page flow, all under myos.
+    QJ="../third_party/quickjs/quickjs.c ../third_party/quickjs/dtoa.c ../third_party/quickjs/libregexp.c ../third_party/quickjs/libunicode.c ../third_party/quickjs/cutils.c"
+    "$cc" -static -no-pie -O2 -fno-stack-protector '-DCONFIG_VERSION="2026-06-04"' \
+        -o "$out/jsdom_test" jsdom_test.c lib/dom.c lib/jsdom.c lib/resolve.c lib/tls.c $QJ -lm || exit 1
+    r=$("$MYOS" "$out/jsdom_test" 2>/dev/null); rc=$?
+    if has "JSDOM_TEST:PASS" "$r" && [ "$rc" -eq 0 ]; then
+        ok "DOM bindings (query/timers/page flow) work under myos"
+    else
+        bad "jsdom_test: rc=$rc out=$r"
+    fi
 else
     echo "skip myos end-to-end checks ($MYOS not built)"
 fi

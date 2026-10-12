@@ -31,6 +31,8 @@
 #include <poll.h>
 #include "lib/resolve.h"
 #include "lib/tls.h"
+#include "lib/dom.h"
+#include "lib/jsdom.h"
 
 #define SYS_DISPLAY_INFO    0x1000
 #define SYS_WINDOW_CREATE   0x1001
@@ -412,48 +414,25 @@ struct tok {
     int link;
 };
 
-static void layout_html(const char *html) {
-    nlines = 0;
-    nlinks = 0;
-    scroll = 0;
+static struct tok toks[4096];
+static int ntoks = 0;
+static int walk_link = -1;
+static char walk_buf[64];
+static size_t walk_len = 0;
+static struct dom_doc *page_doc = NULL;
+static struct jsdom_page *page_js = NULL;
+static void relayout(void);
 
-    /* First pass: words + link spans. */
-    static struct tok toks[4096];
-    int ntoks = 0;
-    int cur_link = -1;
-    char link_url[URL_CAP] = {0};
-
-    /* Scripts have no engine here (see ROADMAP); count them so the page
-     * can say so instead of silently dropping behavior. */
-    nscripts = 0;
-    for (const char *s = html; (s = strcasestr(s, "<script")) != NULL; s += 7)
-        nscripts++;
-
-    const char *p = html;
-    /* Skip to <body> when present. */
-    const char *bs = strstr(p, "<body");
-    if (bs) {
-        const char *ge = strchr(bs, '>');
-        if (ge) p = ge + 1;
-    }
-    static char wbuf[64];
-    size_t wlen = 0;
-    int intag = 0, inhead = 0;
-    static char tag[64];
-    size_t taglen = 0;
-    char href[URL_CAP];
-
-    /* Lambda-free callbacks: inline the flush. */
-#define FLUSH_WORD() do { \
-        if (wlen > 0 && ntoks < 4096) { \
-            wbuf[wlen] = '\0'; \
-            snprintf(toks[ntoks].word, sizeof(toks[ntoks].word), "%s", wbuf); \
-            toks[ntoks].link = cur_link; \
+#define WFLUSH() do { \
+        if (walk_len > 0 && ntoks < 4096) { \
+            walk_buf[walk_len] = '\0'; \
+            snprintf(toks[ntoks].word, sizeof(toks[ntoks].word), "%s", walk_buf); \
+            toks[ntoks].link = walk_link; \
             ntoks++; \
-            wlen = 0; \
+            walk_len = 0; \
         } \
     } while (0)
-#define NEWLINE() do { \
+#define WNEWLINE() do { \
         if (nlines < MAX_LINES) { \
             lines[nlines].text[0] = '\0'; \
             lines[nlines].nrun = 0; \
@@ -461,93 +440,26 @@ static void layout_html(const char *html) {
         } \
     } while (0)
 
-    while (*p && ntoks < 4096 && nlines < MAX_LINES) {
-        if (!intag && *p == '<') {
-            FLUSH_WORD();
-            intag = 1;
-            taglen = 0;
-            href[0] = '\0';
-            p++;
-            continue;
-        }
-        if (intag) {
-            if (*p == '>') {
-                intag = 0;
-                tag[taglen] = '\0';
-                /* tag name: lowercase up to space or /. */
-                char name[16] = {0};
-                size_t ni = 0;
-                int closing = tag[0] == '/';
-                size_t si = closing ? 1 : 0;
-                while (tag[si] && tag[si] != ' ' && tag[si] != '/' && ni < 15)
-                    name[ni++] = (char)tolower((unsigned char)tag[si++]);
-                if (!closing && strcmp(name, "head") == 0) inhead = 1;
-                if (closing && strcmp(name, "head") == 0) inhead = 0;
-                if (inhead) { p++; continue; }
-                if (!closing && strcmp(name, "a") == 0) {
-                    /* href="..." */
-                    const char *h = strstr(tag, "href");
-                    if (h) {
-                        h += 4;
-                        while (*h == ' ' || *h == '=') h++;
-                        char q = (*h == '"' || *h == '\'') ? *h++ : 0;
-                        size_t hi = 0;
-                        while (*h && hi + 1 < sizeof(href) &&
-                               (q ? *h != q : *h != ' ' && *h != '>'))
-                            href[hi++] = *h++;
-                        href[hi] = '\0';
-                        if (nlinks < MAX_LINKS && hi > 0) {
-                            /* resolve later at click time; store raw here */
-                            cur_link = nlinks;
-                            snprintf(links[nlinks].url, sizeof(links[nlinks].url), "%s", href);
-                            links[nlinks].row = -1;
-                            nlinks++;
-                        }
-                    }
-                } else if (closing && strcmp(name, "a") == 0) {
-                    cur_link = -1;
-                } else if (strcmp(name, "br") == 0 || strcmp(name, "p") == 0 ||
-                           strcmp(name, "div") == 0 || strcmp(name, "tr") == 0 ||
-                           strcmp(name, "li") == 0 ||
-                           (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2])) {
-                    if (!closing || strcmp(name, "p") == 0 || strcmp(name, "div") == 0)
-                        NEWLINE();
-                } else if (strcmp(name, "title") == 0) {
-                    /* page <title> becomes the first line when no body text yet */
-                }
-                p++;
-                continue;
-            }
-            /* inside tag text: entities + href capture continue */
-            if (taglen + 1 < sizeof(tag)) tag[taglen++] = *p;
-            /* entities */
-            if (*p == '&') {
-                const char *semi = strchr(p, ';');
-                if (semi && semi - p < 8) {
-                    char ent[10] = {0};
-                    size_t el = (size_t)(semi - p - 1);
-                    memcpy(ent, p + 1, el);
-                    char ec = 0;
-                    if (strcmp(ent, "amp") == 0) ec = '&';
-                    else if (strcmp(ent, "lt") == 0) ec = '<';
-                    else if (strcmp(ent, "gt") == 0) ec = '>';
-                    else if (strcmp(ent, "quot") == 0) ec = '"';
-                    else if (strcmp(ent, "nbsp") == 0) ec = ' ';
-                    if (ec && wlen + 1 < sizeof(wbuf)) wbuf[wlen++] = ec;
-                    p = semi + 1;
-                    continue;
-                }
-            }
-            p++;
-            continue;
-        }
-        /* text */
-        if (*p == '&') {
-            const char *semi = strchr(p, ';');
-            if (semi && semi - p < 8) {
+/* One decoded text char into the word stream. */
+static void walk_char(unsigned char c) {
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (c == ' ') {
+        WFLUSH();
+    } else if (c >= 0x20 && c < 0x7f) {
+        if (walk_len + 1 < sizeof(walk_buf)) walk_buf[walk_len++] = (char)c;
+    } else if (c >= 0x80) {
+        if (walk_len + 1 < sizeof(walk_buf)) walk_buf[walk_len++] = '?';
+    }
+}
+
+static void walk_text(const char *s) {
+    while (*s) {
+        if (*s == '&') {
+            const char *semi = strchr(s, ';');
+            if (semi && semi - s < 8) {
+                size_t el = (size_t)(semi - s - 1);
                 char ent[10] = {0};
-                size_t el = (size_t)(semi - p - 1);
-                memcpy(ent, p + 1, el);
+                memcpy(ent, s + 1, el);
                 char ec = 0;
                 if (strcmp(ent, "amp") == 0) ec = '&';
                 else if (strcmp(ent, "lt") == 0) ec = '<';
@@ -555,24 +467,124 @@ static void layout_html(const char *html) {
                 else if (strcmp(ent, "quot") == 0) ec = '"';
                 else if (strcmp(ent, "nbsp") == 0) ec = ' ';
                 if (ec) {
-                    if (wlen + 1 < sizeof(wbuf)) wbuf[wlen++] = ec;
-                    p = semi + 1;
+                    walk_char((unsigned char)ec);
+                    s = semi + 1;
                     continue;
                 }
             }
         }
-        unsigned char c = (unsigned char)*p;
-        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-        if (c == ' ') {
-            FLUSH_WORD();
-        } else if (c >= 0x20 && c < 0x7f) {
-            if (wlen + 1 < sizeof(wbuf)) wbuf[wlen++] = (char)c;
-        } else if (c >= 0x80) {
-            if (wlen + 1 < sizeof(wbuf)) wbuf[wlen++] = '?';
-        }
-        p++;
+        walk_char((unsigned char)*s++);
     }
-    FLUSH_WORD();
+}
+
+static int walk_block_tag(int tag) {
+    return tag == TAG_BR || tag == TAG_P || tag == TAG_DIV ||
+           tag == TAG_TR || tag == TAG_LI ||
+           (tag >= TAG_H1 && tag <= TAG_H6);
+}
+
+/* First pass over the tree: words + link spans. */
+static void walk_node(struct dom_node *n) {
+    if (!n) return;
+    if (n->text) {
+        walk_text(n->text);
+        return;
+    }
+    if (n->tag == TAG_HEAD || n->tag == TAG_SCRIPT || n->tag == TAG_STYLE ||
+        n->tag == TAG_NOSCRIPT) {
+        return; /* head, scripts and styles never render */
+    }
+    if (n->tag == TAG_A) {
+        const char *href = dom_attr(n, "href");
+        int save = walk_link;
+        if (href && href[0] && nlinks < MAX_LINKS) {
+            walk_link = nlinks;
+            snprintf(links[nlinks].url, sizeof(links[nlinks].url), "%s", href);
+            links[nlinks].row = -1;
+            nlinks++;
+        }
+        for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
+        walk_link = save;
+        return;
+    }
+    if (walk_block_tag(n->tag)) WNEWLINE();
+    for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
+    if (n->tag == TAG_P || n->tag == TAG_DIV) WNEWLINE();
+}
+
+/* Finds the body element, if any. */
+static void find_body_walk(struct dom_node *n, struct dom_node **hit) {
+    if (*hit || !n) return;
+    if (n->tag == TAG_BODY) {
+        *hit = n;
+        return;
+    }
+    for (int i = 0; i < n->nkids; i++) find_body_walk(n->kids[i], hit);
+}
+
+static void layout_html(const char *html) {
+    nlines = 0;
+    nlinks = 0;
+    scroll = 0;
+    ntoks = 0;
+    walk_len = 0;
+    walk_link = -1;
+
+    /* Parse once; scripts run against this tree before layout. */
+    if (page_doc) {
+        dom_free(page_doc);
+        page_doc = NULL;
+    }
+    page_doc = dom_parse(html ? html : "");
+    if (!page_doc) {
+        snprintf(lines[0].text, sizeof(lines[0].text), "(empty page)");
+        lines[0].nrun = 0;
+        nlines = 1;
+        return;
+    }
+
+    /* Scripts run against the tree before layout, through QuickJS. */
+    {
+        const char **ss = NULL;
+        nscripts = dom_scripts(page_doc, &ss);
+        if (ss) {
+            for (int i = 0; i < nscripts; i++) free((void *)ss[i]);
+            free(ss);
+        }
+    }
+    if (page_js) {
+        jsdom_free(page_js);
+        page_js = NULL;
+    }
+    if (nscripts > 0) {
+        char jserr[128] = {0};
+        page_js = jsdom_run(page_doc, urlbar, jserr, sizeof(jserr));
+        if (!page_js && jserr[0])
+            fprintf(stderr, "browser: js: %s\n", jserr);
+        else if (page_js)
+            fprintf(stderr, "browser: js ran %d script(s)\n", nscripts);
+    }
+
+    relayout();
+}
+
+/* Re-walks the live tree into lines: used after parsing, and again
+ * whenever scripts mutate the page (timers, events) so the screen
+ * follows the DOM instead of freezing at first paint. */
+static void relayout(void) {
+    if (!page_doc) return;
+    nlines = 0;
+    nlinks = 0;
+    ntoks = 0;
+    walk_len = 0;
+    walk_link = -1;
+    /* Layout the body when present, else the whole tree. */
+    struct dom_node *start = NULL;
+    find_body_walk(page_doc->root, &start);
+    if (!start) start = page_doc->root;
+    walk_node(start);
+    WFLUSH();
+
 
     /* Second pass: fill lines greedily, recording one run per word so
      * links keep their color even mid-line. */
@@ -998,6 +1010,7 @@ static int dragging = 0;
 static int grab_x = 0, grab_y = 0;
 static int own_x = 0, own_y = 0;
 
+
 static void draw_bar(void) {
     unsigned int *px = (unsigned int *)win_buf;
     /* Title strip: drag handle + close box. */
@@ -1084,36 +1097,39 @@ static void draw_bar(void) {
     }
 }
 
+/* Renders the current page state (called after layout and on input). */
 static void render(void) {
     if (!win_buf) return;
     unsigned int *px = (unsigned int *)win_buf;
     for (unsigned i = 0; i < win_w * win_h; i++) px[i] = BG_MAIN;
     /* Page rows as per-run colored text; links in link color. */
-    int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
-    char run[LINE_COLS + 1];
-    for (int r = 0; r < rows; r++) {
-        int lr = scroll + r;
-        if (lr < 0 || lr >= nlines) continue;
-        const char *t = lines[lr].text;
-        if (!t[0]) continue;
-        if (lines[lr].nrun == 0) {
-            syscall(SYS_WINDOW_DRAW_TEXT, win, 0, CHROME_H + r * CHAR_H,
-                    FG_TEXT, BG_MAIN, t);
-            continue;
-        }
-        for (int k = 0; k < lines[lr].nrun; k++) {
-            int c0 = lines[lr].runs[k].c0;
-            int c1 = lines[lr].runs[k].c1;
-            int li = lines[lr].runs[k].link;
-            if (c0 < 0) c0 = 0;
-            if (c1 > (int)strlen(t)) c1 = (int)strlen(t);
-            if (c1 <= c0) continue;
-            int n = c1 - c0;
-            if (n > (int)sizeof(run) - 1) n = (int)sizeof(run) - 1;
-            memcpy(run, t + c0, (size_t)n);
-            run[n] = '\0';
-            syscall(SYS_WINDOW_DRAW_TEXT, win, c0 * CHAR_W, CHROME_H + r * CHAR_H,
-                    li >= 0 ? FG_LINK : FG_TEXT, BG_MAIN, run);
+    {
+        int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
+        char run[LINE_COLS + 1];
+        for (int r = 0; r < rows; r++) {
+            int lr = scroll + r;
+            if (lr < 0 || lr >= nlines) continue;
+            const char *t = lines[lr].text;
+            if (!t[0]) continue;
+            if (lines[lr].nrun == 0) {
+                syscall(SYS_WINDOW_DRAW_TEXT, win, 0, CHROME_H + r * CHAR_H,
+                        FG_TEXT, BG_MAIN, t);
+                continue;
+            }
+            for (int k = 0; k < lines[lr].nrun; k++) {
+                int c0 = lines[lr].runs[k].c0;
+                int c1 = lines[lr].runs[k].c1;
+                int li = lines[lr].runs[k].link;
+                if (c0 < 0) c0 = 0;
+                if (c1 > (int)strlen(t)) c1 = (int)strlen(t);
+                if (c1 <= c0) continue;
+                int n = c1 - c0;
+                if (n > (int)sizeof(run) - 1) n = (int)sizeof(run) - 1;
+                memcpy(run, t + c0, (size_t)n);
+                run[n] = '\0';
+                syscall(SYS_WINDOW_DRAW_TEXT, win, c0 * CHAR_W, CHROME_H + r * CHAR_H,
+                        li >= 0 ? FG_LINK : FG_TEXT, BG_MAIN, run);
+            }
         }
     }
     draw_bar();
@@ -1126,8 +1142,9 @@ static void render(void) {
                 pp[y * win_w + x] = BG_BAR;
         char st[128];
         if (nscripts > 0)
-            snprintf(st, sizeof(st), "%s [+%d script%s, no JS engine]", status,
-                     nscripts, nscripts == 1 ? "" : "s");
+            snprintf(st, sizeof(st), "%s [+%d script%s%s]", status,
+                     nscripts, nscripts == 1 ? "" : "s",
+                     page_js ? ", js ran" : ", no JS engine");
         else
             snprintf(st, sizeof(st), "%s", status);
         st[win_w / CHAR_W > 1 ? win_w / CHAR_W - 1 : 0] = '\0';
@@ -1205,8 +1222,7 @@ static void go_forward(void) {
 }
 
 static void go_home(void) {
-    navigate("https://wiby.me/", 1);
-    present();
+    navigate("https://www.google.com/", 1);
 }
 
 static void reload(void) {
@@ -1239,8 +1255,8 @@ static void toggle_mark(void) {
 static int build_window(unsigned w, unsigned h) {
     if (w < 200 || h < 120 || w > 2048 || h > 2048) return -1;
     if (win >= 0) syscall(SYS_WINDOW_DESTROY, win, 0, 0, 0, 0, 0);
-    win_w = w > 640 ? 640 : w;
-    win_h = h > 480 ? 480 : h;
+    win_w = w;
+    win_h = h;
     win = (int)syscall(SYS_WINDOW_CREATE, win_w, win_h, 0, 0, 0, 0);
     if (win < 0) return -1;
     struct window_info wi;
@@ -1275,7 +1291,7 @@ int main(int argc, char **argv) {
     input_fd = (int)syscall(SYS_INPUT_FD, 0, 0, 0, 0, 0, 0);
     if (input_fd < 0) return die("input_fd");
 
-    const char *start = argc > 1 ? argv[1] : "http://localhost:80/";
+    const char *start = argc > 1 ? argv[1] : "https://www.google.com/";
     fprintf(stderr, "browser: start %s\n", start);
     snprintf(urlbar, sizeof(urlbar), "%s", start);
     url_len = (int)strlen(urlbar);
@@ -1285,11 +1301,38 @@ int main(int argc, char **argv) {
         layout_html("<html><body><p>Type a URL above and press Return.</p></body></html>");
     present();
 
+    /* Embedded mode follows the desktop's app area (see geom file). */
+    int embedded = getenv("MYOS_EMBED_PARENT") != NULL;
+    int geom_tick = 0;
     struct pollfd pfd = { .fd = input_fd, .events = POLLIN };
     for (;;) {
         /* Reap downloaded apps that ran and exited. */
         int st;
         while (waitpid(-1, &st, WNOHANG) > 0) {}
+        /* Page timers (setTimeout/setInterval) fire here; the tree may
+         * have mutated, so re-layout before repainting. */
+        if (page_js && jsdom_poll(page_js)) {
+            relayout();
+            present();
+        }
+        /* Every ~3s, check whether the desktop resized under us. */
+        if (embedded && ++geom_tick >= 30) {
+            geom_tick = 0;
+            FILE *gf = fopen("/winserv/desktop/geom", "r");
+            if (gf) {
+                unsigned gw = 0, gh = 0;
+                if (fscanf(gf, "%ux%u", &gw, &gh) == 2 &&
+                    gw >= 200 && gh >= 120 && gw <= 2048 && gh <= 2048 &&
+                    (gw != win_w || gh != win_h)) {
+                    syscall(SYS_WINDOW_RESIZE, win, gw, gh, 0, 0, 0, 0);
+                    if (build_window(gw, gh) == 0) {
+                        relayout();
+                        present();
+                    }
+                }
+                fclose(gf);
+            }
+        }
         int ret = poll(&pfd, 1, 100);
         if (ret > 0 && (pfd.revents & POLLIN)) {
             struct input_event ev;
@@ -1300,6 +1343,7 @@ int main(int argc, char **argv) {
                 /* Host resized the window: rebuild the buffer and
                  * re-render the current page into it. */
                 if (build_window(ev.width, ev.height) == 0) {
+                    relayout();
                     int rows = ((int)win_h - CHROME_H - STATUS_H) / CHAR_H;
                     int max = nlines - rows;
                     if (max < 0) max = 0;

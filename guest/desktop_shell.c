@@ -217,6 +217,15 @@ static int build_desktop(unsigned int w, unsigned int h) {
     syscall(SYS_WINDOW_SET_TITLE, panel_win, "myos panel", 0, 0, 0, 0);
     draw_panel(panel_buf, panel_info.width, panel_info.height);
     syscall(SYS_WINDOW_PRESENT, panel_win, 0, 0, 0, 0, 0);
+    /* Publish the app area so embedded windows can follow resizes. */
+    {
+        FILE *f = fopen("/winserv/desktop/geom", "w");
+        if (f) {
+            unsigned int ah = h > PANEL_HEIGHT ? h - PANEL_HEIGHT : h;
+            fprintf(f, "%ux%u\n", w, ah);
+            fclose(f);
+        }
+    }
     fprintf(stderr, "desktop_shell: desktop %ux%u\n", w, h);
     return 0;
 }

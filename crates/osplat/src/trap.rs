@@ -37,7 +37,7 @@ use oscore::syscall::{
     PROT_READ, PROT_WRITE, SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CLONE, SYS_CLOSE, SYS_CONNECT,
     SYS_DUP, SYS_DUP2, SYS_DUP3, SYS_EXECVE, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETDENTS,
     SYS_GETPEERNAME, SYS_GETPGID, SYS_GETPGRP, SYS_GETPID, SYS_GETSID, SYS_GETSOCKNAME,
-    SYS_GETSOCKOPT, SYS_IOCTL, SYS_KILL, SYS_LISTEN,     SYS_DISPLAY_XID, SYS_OPEN, SYS_OPENAT, SYS_PIPE, SYS_PIPE2, SYS_POLL, SYS_WINDOW_MOVE,
+    SYS_GETSOCKOPT, SYS_IOCTL, SYS_KILL, SYS_LISTEN,     SYS_DISPLAY_XID, SYS_OPEN, SYS_OPENAT, SYS_PIPE, SYS_PIPE2, SYS_POLL, SYS_WINDOW_MOVE, SYS_WINDOW_RESIZE,
     SYS_READ, SYS_RECVFROM, SYS_RECVMSG, SYS_RT_SIGRETURN, SYS_SENDMSG, SYS_SENDTO, SYS_SETPGID,
     SYS_SETSID, SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR, SYS_SYNC_FS,
     SYS_UNLINK, SYS_UNLINKAT, SYS_WAIT4, SYS_WRITE,
@@ -1299,9 +1299,10 @@ fn host_bridge_open(path: &[u8], flags: i32, mode: u32) -> Option<Result<i32, i6
 /// the path is outside the namespace or no rootfs is configured.
 ///
 /// Bridged: the directory itself, `server.pid`, the `clients` directory,
-/// `clients/<pid>`, and the `desktop` directory with its `xid` rendezvous
-/// file. Anything else (deeper paths, `..`) stays in the guest VFS, so a
-/// guest cannot use this hole to reach the rest of the rootfs.
+/// `clients/<pid>`, and the `desktop` directory with its `xid` and `geom`
+/// rendezvous files. Anything else (deeper paths, `..`) stays in the
+/// guest VFS, so a guest cannot use this hole to reach the rest of the
+/// rootfs.
 fn winserv_host_path(path: &[u8]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let root = root()?;
@@ -1315,9 +1316,9 @@ fn winserv_host_path(path: &[u8]) -> Option<PathBuf> {
         base.push(std::ffi::OsStr::from_bytes(rel));
         return Some(base);
     }
-    if rel == b"desktop/xid" {
+    if rel == b"desktop/xid" || rel == b"desktop/geom" {
         base.push("desktop");
-        base.push("xid");
+        base.push(std::ffi::OsStr::from_bytes(&rel[b"desktop/".len()..]));
         return Some(base);
     }
     let name = rel.strip_prefix(b"clients/")?;
@@ -1844,6 +1845,14 @@ fn process_syscall(regs_in: &Registers, uc: &mut ucontext_t) -> bool {
             // model, so this arm never claims the syscall.
             if std::env::var_os("MYOS_EMBED_PARENT").is_some() {
                 crate::display::move_outer(regs_in.arg(1) as i32, regs_in.arg(2) as i32);
+            }
+            false
+        }
+        SYS_WINDOW_RESIZE => {
+            // Same for resizes: the outer host window follows, the guest
+            // model updates in the dispatcher below.
+            if std::env::var_os("MYOS_EMBED_PARENT").is_some() {
+                crate::display::resize_outer(regs_in.arg(1) as u32, regs_in.arg(2) as u32);
             }
             false
         }

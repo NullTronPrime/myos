@@ -36,12 +36,20 @@ scripts/        build and run helpers
 - A Rust toolchain and `cargo`.
 - `gcc` to build the guest programs.
 - `readelf` is optional (used by the contract tests).
+- For sound: `ffmpeg` and `pulseaudio-utils` (`paplay`), or set
+  `MYOS_AUDIO_CMD` to redirect playback.
+- For the local-TLS and network contract tests: `python3`, `openssl`.
+- For live windows: an X server (WSLg on Windows, X11 on Linux).
 
 ## Build and run
 
 ```sh
-scripts/build.sh      # builds the kernel + guests+ assembles target/rootfs
+scripts/build.sh      # builds the kernel + guests + assembles target/rootfs
 scripts/run.sh        # opens the myos shell
+scripts/live.sh desktop_shell            # full desktop in a live window (WSLg/X11)
+scripts/live.sh browser <url>            # browser alone, live
+scripts/shot.sh browser <url>            # headless screenshot to target/shots/
+scripts/snd.sh song.mp3 song.u8          # convert audio to 8-bit for /dev/audio
 ```
 
 `scripts/run.sh` sets `MYOS_ROOT=target/rootfs`, which backs the guest's `/`.
@@ -92,8 +100,76 @@ gcc -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
 
 ## Tests
 
-`guest/contracts.sh` just a really large check
+`guest/contracts.sh` is the contract suite (49 checks and counting): seccomp
+trap behavior, syscalls, processes, display, input, sockets, `poll` waits,
+local TLS for both cipher suites, P-256/GCM self-checks, the HTML parser,
+and the DOM bindings — all runnable headless under WSL2.
 
 ```sh
 bash guest/contracts.sh
+cargo test -p oscore --lib   # 337 kernel unit tests
+cargo test -p osplat --lib   # platform tests (keymap, loader, …)
 ```
+
+## Capabilities
+
+**Processes.** `fork`/`execve`/`wait4`, `clone` (fork-like and thread-like),
+`futex`, signals with real handlers (`rt_sigreturn`, blocking, fault routing),
+ptys (`/dev/ptmx`, `grantpt`, job control), pipes, shared memory (`memfd`,
+`shm_open`), and environment inheritance rules that keep the dynamic linker
+hermetic (empty guest env by design; the re-exec trampoline forwards only
+`DISPLAY`/`MYOS_*`).
+
+**Display.** A real X11 client (hand-rolled protocol, no toolkit): live windows
+at ~60fps with damage tracking, plus headless PPM snapshots. Windows support
+create/map/present/move/resize/destroy/raise/focus, 8x8 text, and 32-bit color.
+Input arrives as key/mouse/resize/close events; `poll` with a timeout genuinely
+waits (blocking host-side, then re-running the call). Keyboard covers the full
+PC/XT map including Shift symbols and both Enters.
+
+**Desktop.** Wallpaper, dock-style taskbar (launcher pill, per-app icon tiles,
+live window census with running indicators, clock), Alt+Tab, and window
+drag/resize/close. Apps embed *inside* the one desktop window: their outer X
+windows reparent into it (rendezvous via `/winserv/desktop/xid`), follow
+resizes through `/winserv/desktop/geom`, and keep their own input. Resizing the
+OS window rebuilds every buffer and re-lays out.
+
+**Terminal & shell.** Multi-tab terminal over ptys; `sh2` with PATH lookup,
+redirection, pipes, background jobs, env expansion, and builtins.
+
+**Networking.** Full socket delegation (stream/datagram, socketpair, options,
+nonblocking `connect` with timeout), a static-friendly resolver (numeric,
+`/etc/hosts`, hand-built DNS over UDP with TCP fallback across every
+nameserver), HTTP/1.1 with chunked decoding, and redirect following.
+`fetch <host> [port] [path] [--body]` proves any of it in one line.
+
+**TLS 1.2.** Hand-rolled: `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` preferred
+(P-256 ECDH with on-curve validation, AES-GCM, SNI/groups/ALPN/sigalgs,
+`ServerKeyExchange` RSA/SHA-256 verification) with `TLS_RSA_WITH_AES_128_CBC_SHA`
+fallback. RSA certificates only, hostname checking with a real DER walk of
+SAN lists, expiry sanity — but no chain-of-trust validation (toy-grade, and it
+says so). Verified against real sites, not just localhost.
+
+**Browser.** One window: title strip (drag + close), nav row (back/forward/
+reload/home, dimmed when useless), blurple URL pill, bookmarks bar with a
+working star, page viewport, status line. Renders tag-stripped HTML with blue
+clickable links, scrollback, and history; downloads binaries to `/downloads`
+and runs them on click (explicit consent model). Bare hostnames gain `https://`,
+single words search, 301/302/303/307/308 followed, truncated closes tolerated.
+
+**JavaScript.** QuickJS linked straight into the browser (no daemon): pages
+parse to a real node tree (`guest/lib/dom.c`), scripts run pre-render against
+DOM bindings (`guest/lib/jsdom.c`) — `document`/`Element` queries and mutation,
+`innerHTML`, timers firing from the main loop with re-layout, synchronous XHR
+over our own sockets, `console.log`. One bad script never kills the rest.
+What the engine can't do (layout-geometry APIs, full modern surface) fails
+loudly per-script instead of silently.
+
+**Sound.** 8-bit minimalist: write unsigned 8-bit mono 8000 Hz PCM to
+`/dev/audio` and the kernel streams it to the host player (PulseAudio).
+`scripts/snd.sh` converts anything ffmpeg reads; `beep [freq]` tests the path;
+`MYOS_AUDIO_CMD` redirects playback (e.g. `tee /tmp/cap.u8`) for headless tests.
+
+**Tools.** `js` runs scripts/files under the trap (`print`, real exit codes);
+`beep` checks audio; `fetch` probes the network; `dom_test`/`jsdom_test`/
+`poll_test`/`ec_test` pin their subsystems in contracts.

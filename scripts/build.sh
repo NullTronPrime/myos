@@ -25,7 +25,18 @@ done
 # a static guest can neither see nor load. Both link the minimal TLS 1.2
 # client (guest/lib/tls.c) for https:// URLs.
 "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/fetch" guest/fetch.c guest/lib/resolve.c guest/lib/tls.c
-"$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/browser" guest/browser.c guest/lib/resolve.c guest/lib/tls.c
+"$cc" -static -no-pie -O2 -fno-stack-protector '-DCONFIG_VERSION="2026-06-04"' \
+    -o "$out/browser" guest/browser.c guest/lib/resolve.c guest/lib/tls.c \
+    guest/lib/dom.c guest/lib/jsdom.c third_party/quickjs/quickjs.c \
+    third_party/quickjs/dtoa.c third_party/quickjs/libregexp.c \
+    third_party/quickjs/libunicode.c third_party/quickjs/cutils.c -lm
+# js: QuickJS linked into a static guest (core engine only: no libc
+# helpers, no intl/temporal data; no host libc beyond what the other
+# guests use). ~30s of compile for the engine.
+"$cc" -static -no-pie -O2 -fno-stack-protector '-DCONFIG_VERSION="2026-06-04"' \
+    -o "$out/js" guest/js.c third_party/quickjs/quickjs.c \
+    third_party/quickjs/dtoa.c third_party/quickjs/libregexp.c \
+    third_party/quickjs/libunicode.c third_party/quickjs/cutils.c -lm
 
 # A dynamically linked guest: exercises PT_INTERP + host ld.so inside myos.
 "$cc" -O2 -o "$out/dyn_hello" guest/dyn_hello.c
@@ -47,7 +58,7 @@ done
 # Populate the directory the guest sees as /.
 cp "$out/sh" "$out/sh2" "$out/init" "$out/window_server" "$out/desktop_shell" "$out/terminal" \
    "$out/dyn_hello" "$out/pie_guest" "$out/selfhost" \
-   "$out/catfile" "$out/catstdin" "$out/fetch" "$out/browser" "$root/bin/"
+   "$out/catfile" "$out/catstdin" "$out/fetch" "$out/browser" "$out/beep" "$out/js" "$root/bin/"
 printf 'myos: parasitic kernel, running inside a process.\n' > "$root/etc/motd"
 printf 'os-1.0\n' > "$root/etc/version"
 

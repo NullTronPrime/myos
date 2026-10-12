@@ -823,6 +823,35 @@ pub fn xid() -> Option<u32> {
         .map(|d| d.window)
 }
 
+/// Resizes the outer window (embedded apps following a desktop resize).
+/// Mirrors move_outer: guest-model resize is handled by the dispatcher.
+pub fn resize_outer(width: u32, height: u32) -> bool {
+    let mut guard = slot().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(d) = guard.as_mut() else {
+        return false;
+    };
+    let mut req = Vec::with_capacity(20);
+    req.push(OP_CONFIGURE_WINDOW);
+    req.push(0); // unused
+    req.extend_from_slice(&[0, 0]); // request length, filled in below
+    req.extend_from_slice(&d.window.to_le_bytes());
+    req.extend_from_slice(&0x0000_000cu16.to_le_bytes()); // width | height
+    req.extend_from_slice(&[0, 0]); // unused
+    req.extend_from_slice(&(width as u16).to_le_bytes());
+    req.extend_from_slice(&[0, 0]); // padding
+    req.extend_from_slice(&(height as u16).to_le_bytes());
+    req.extend_from_slice(&[0, 0]); // padding
+    if finish(&mut req, 2).is_none() {
+        return false;
+    }
+    if write_all(&mut d.stream, &req).is_none() {
+        return false;
+    }
+    d.width = width;
+    d.height = height;
+    true
+}
+
 /// Moves the outer window (embedded drag). Coordinates are parent-relative
 /// i16s; the guest model move is handled by the dispatcher, this only
 /// tells the server.
