@@ -15,6 +15,7 @@ static int tag_id(const char *name) {
         "ul", "ol", "li", "table", "tr", "td",
         "form", "input", "button", "script", "style",
         "meta", "link", "hr", "b", "i", "noscript",
+        "blockquote", "th", "textarea",
         NULL
     };
     for (int i = 1; names[i]; i++)

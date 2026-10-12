@@ -38,6 +38,10 @@ int jsdom_poll(struct jsdom_page *pg);
 /* Frees the page (context, timers, callbacks). */
 void jsdom_free(struct jsdom_page *pg);
 
+/* Runs the node's click listeners (user tap on a script-driven
+ * control); pending jobs drain before return. */
+void jsdom_click_node(struct jsdom_page *pg, struct dom_node *n);
+
 /* Current monotonic milliseconds (shared clock for timers). */
 long jsdom_now_ms(void);
 

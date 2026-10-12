@@ -165,6 +165,42 @@ static JSValue el_set_id(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     return JS_UNDEFINED;
 }
 
+/* Reflected content attributes: el.href = x behaves like
+ * setAttribute("href", x), so script-built links and values reach
+ * layout instead of dying as invisible JS expandos. */
+#define EL_REFLECT(prop, attr) \
+static JSValue el_get_##prop(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) { \
+    (void)argc; (void)argv; \
+    struct dom_node *n = this_node(ctx, self); \
+    const char *v = n ? dom_attr(n, attr) : NULL; \
+    if (!v && n && strcmp(attr, "value") == 0 && n->tag == TAG_TEXTAREA) { \
+        char *t = dom_text_content(n); \
+        JSValue r = JS_NewString(ctx, t ? t : ""); \
+        free(t); \
+        return r; \
+    } \
+    return JS_NewString(ctx, v ? v : ""); \
+} \
+static JSValue el_set_##prop(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) { \
+    if (argc < 1) return JS_UNDEFINED; \
+    struct dom_node *n = this_node(ctx, self); \
+    const char *v = JS_ToCString(ctx, argv[0]); \
+    if (n && v) dom_set_attr(n, attr, v); \
+    JS_FreeCString(ctx, v); \
+    return JS_UNDEFINED; \
+}
+EL_REFLECT(href, "href")
+EL_REFLECT(src, "src")
+EL_REFLECT(value, "value")
+EL_REFLECT(title, "title")
+EL_REFLECT(type, "type")
+EL_REFLECT(name, "name")
+EL_REFLECT(alt, "alt")
+EL_REFLECT(action, "action")
+EL_REFLECT(target, "target")
+EL_REFLECT(placeholder, "placeholder")
+EL_REFLECT(className, "class")
+
 static JSValue el_get_tag(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
     (void)argc;
     (void)argv;
@@ -612,6 +648,11 @@ static JSValue win_clear(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     return JS_UNDEFINED;
 }
 
+static JSValue perf_now(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    (void)self; (void)argc; (void)argv;
+    return JS_NewFloat64(ctx, (double)jsdom_now_ms());
+}
+
 /* ---------------- synchronous XHR (own socket stack) ---------------- */
 
 #include "resolve.h"
@@ -976,6 +1017,17 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
     set_getset(ctx, el_proto, "textContent", el_text_content, el_set_text_content);
     set_fn(ctx, el_proto, "getAttribute", el_get_attr, 1);
     set_fn(ctx, el_proto, "setAttribute", el_set_attr, 2);
+    set_getset(ctx, el_proto, "href", el_get_href, el_set_href);
+    set_getset(ctx, el_proto, "src", el_get_src, el_set_src);
+    set_getset(ctx, el_proto, "value", el_get_value, el_set_value);
+    set_getset(ctx, el_proto, "title", el_get_title, el_set_title);
+    set_getset(ctx, el_proto, "type", el_get_type, el_set_type);
+    set_getset(ctx, el_proto, "name", el_get_name, el_set_name);
+    set_getset(ctx, el_proto, "alt", el_get_alt, el_set_alt);
+    set_getset(ctx, el_proto, "action", el_get_action, el_set_action);
+    set_getset(ctx, el_proto, "target", el_get_target, el_set_target);
+    set_getset(ctx, el_proto, "placeholder", el_get_placeholder, el_set_placeholder);
+    set_getset(ctx, el_proto, "className", el_get_className, el_set_className);
     set_fn(ctx, el_proto, "appendChild", el_append_child, 1);
     set_fn(ctx, el_proto, "addEventListener", el_add_listener, 2);
     set_fn(ctx, el_proto, "click", el_click, 0);
@@ -1053,6 +1105,10 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
         JSValue console = JS_NewObject(ctx);
         set_fn(ctx, console, "log", js_console_log, 1);
         JS_SetPropertyStr(ctx, global, "console", console);
+        JSValue perf = JS_NewObject(ctx);
+        set_fn(ctx, perf, "now", perf_now, 0);
+        JS_SetPropertyStr(ctx, perf, "timeOrigin", JS_NewFloat64(ctx, 0));
+        JS_SetPropertyStr(ctx, global, "performance", perf);
         JS_SetPropertyStr(ctx, global, "window", JS_DupValue(ctx, global));
     }
 
@@ -1060,19 +1116,24 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
     {
         const char **ss = NULL;
         int ns = dom_scripts(doc, &ss);
+        int nfail = 0;
         for (int i = 0; i < ns; i++) {
             JSValue v = JS_Eval(ctx, ss[i], strlen(ss[i]), "<script>", JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(v)) {
-                /* One bad script must not kill the rest: report each
-                 * failure (browsers log them all) and carry on. */
+                /* One bad script must not kill the rest: log the first
+                 * two in full (real browsers log them all, but Google
+                 * ships a dozen probing scripts that all fail the same
+                 * way), count the rest, and carry on. */
+                nfail++;
                 {
                     JSValue ex = JS_GetException(ctx);
                     const char *s = JS_ToCString(ctx, ex);
                     JSValue st = JS_GetPropertyStr(ctx, ex, "stack");
                     const char *stack = NULL;
                     if (!JS_IsUndefined(st)) stack = JS_ToCString(ctx, st);
-                    fprintf(stderr, "browser: js script %d: %.80s || %.120s\n", i,
-                            s ? s : "script error", stack ? stack : "");
+                    if (nfail <= 2)
+                        fprintf(stderr, "browser: js script %d: %.80s || %.120s\n", i,
+                                s ? s : "script error", stack ? stack : "");
                     if (!err[0])
                         snprintf(err, errcap, "%.100s", s ? s : "script error");
                     JS_FreeCString(ctx, s);
@@ -1090,6 +1151,9 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
             while (JS_ExecutePendingJob(JS_GetRuntime(ctx), &pctx) > 0) {}
         }
         free(ss);
+        if (nfail > 2)
+            fprintf(stderr, "browser: js [+%d more script error(s); page rendered anyway]\n",
+                    nfail - 2);
     }
     /* DOMContentLoaded, then load. */
     fire_listeners(pg, NULL, "DOMContentLoaded");
@@ -1100,6 +1164,18 @@ struct jsdom_page *jsdom_run(struct dom_doc *doc, const char *url, char *err, si
     }
     JS_FreeValue(ctx, global);
     return pg;
+}
+
+/* Dispatches a real click to the page's own handlers for a node the
+ * user tapped (jsaction/button/anchor-without-href). Errors stay
+ * isolated per listener; the tree may mutate, so callers re-layout. */
+void jsdom_click_node(struct jsdom_page *pg, struct dom_node *n) {
+    if (!pg || !n) return;
+    fire_listeners(pg, n, "click");
+    {
+        JSContext *pctx = NULL;
+        while (JS_ExecutePendingJob(JS_GetRuntime(pg->ctx), &pctx) > 0) {}
+    }
 }
 
 int jsdom_poll(struct jsdom_page *pg) {

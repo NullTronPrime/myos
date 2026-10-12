@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -125,6 +126,8 @@ struct link {
     int row, c0, c1; /* row and half-open column range in page coords */
     char url[URL_CAP];
     struct dom_node *field; /* non-NULL for form-field clicks (no navigate) */
+    struct dom_node *action; /* non-NULL for script-driven controls: taps
+                              * dispatch click to the page's own handlers */
 };
 
 static int win = -1;
@@ -311,7 +314,7 @@ static int fetch_page(const char *url) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: parasyteos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\nConnection: close\r\n\r\n",
              path, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -410,10 +413,13 @@ static int fetch_page(const char *url) {
 
 /* ---------------- HTML to lines ---------------- */
 
-/* Layout: tokenise into words with link tags, then fill lines. */
+/* Layout: tokenise into words with link tags, then fill lines.
+ * brk tokens are block boundaries (div/p/li/...): the filler turns
+ * them into line breaks, so structure survives the word flow. */
 struct tok {
     char word[64];
     int link;
+    int brk;
 };
 
 static struct tok toks[4096];
@@ -433,15 +439,18 @@ static struct dom_node *focused_input = NULL;
             walk_buf[walk_len] = '\0'; \
             snprintf(toks[ntoks].word, sizeof(toks[ntoks].word), "%s", walk_buf); \
             toks[ntoks].link = walk_link; \
+            toks[ntoks].brk = 0; \
             ntoks++; \
             walk_len = 0; \
         } \
     } while (0)
 #define WNEWLINE() do { \
-        if (nlines < MAX_LINES) { \
-            lines[nlines].text[0] = '\0'; \
-            lines[nlines].nrun = 0; \
-            nlines++; \
+        WFLUSH(); \
+        if (ntoks < 4096) { \
+            toks[ntoks].word[0] = '\0'; \
+            toks[ntoks].link = -1; \
+            toks[ntoks].brk = 1; \
+            ntoks++; \
         } \
     } while (0)
 
@@ -502,6 +511,49 @@ static int walk_block_tag(int tag) {
            (tag >= TAG_H1 && tag <= TAG_H6);
 }
 
+/* Emits a structural marker word (heading hashes, bullets, rules). */
+static void walk_marker(const char *s) {
+    WFLUSH();
+    while (*s && *s != ' ') {
+        if (walk_len + 1 < sizeof(walk_buf)) walk_buf[walk_len++] = *s;
+        s++;
+    }
+    WFLUSH();
+}
+
+static void walk_node(struct dom_node *n);
+
+/* A script-driven control: taps run the page's own click listeners
+ * instead of navigating. Covers <button>, jsaction/onclick hooks,
+ * role=button/link spans, and href-less anchors (theme toggles,
+ * menus): all render as clickable spans like links. */
+static int node_actionable(struct dom_node *n) {
+    if (!n || n->text) return 0;
+    if (n->tag == TAG_BUTTON) return 1;
+    if (dom_attr(n, "jsaction") || dom_attr(n, "onclick")) return 1;
+    const char *role = dom_attr(n, "role");
+    if (role && (strcasecmp(role, "button") == 0 ||
+                 strcasecmp(role, "link") == 0)) return 1;
+    return 0;
+}
+
+static void walk_actionable(struct dom_node *n) {
+    int save = walk_link;
+    if (nlinks < MAX_LINKS) {
+        walk_link = nlinks;
+        links[nlinks].url[0] = '\0';
+        links[nlinks].row = -1;
+        links[nlinks].field = NULL;
+        links[nlinks].action = n;
+        nlinks++;
+        for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
+        WFLUSH(); /* trailing fragment keeps this span, not the next */
+        walk_link = save;
+    } else {
+        for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
+    }
+}
+
 /* First pass over the tree: words + link spans. Element boundaries
  * break words (the old streaming tokenizer flushed at every tag). */
 static void walk_node(struct dom_node *n) {
@@ -517,12 +569,19 @@ static void walk_node(struct dom_node *n) {
     }
     if (n->tag == TAG_A) {
         const char *href = dom_attr(n, "href");
+        if (!href || !href[0]) {
+            /* Href-less anchor: only the page's own script can act on
+             * it (menus, toggles); taps dispatch click to handlers. */
+            walk_actionable(n);
+            return;
+        }
         int save = walk_link;
-        if (href && href[0] && nlinks < MAX_LINKS) {
+        if (nlinks < MAX_LINKS) {
             walk_link = nlinks;
             snprintf(links[nlinks].url, sizeof(links[nlinks].url), "%s", href);
             links[nlinks].row = -1;
             links[nlinks].field = NULL;
+            links[nlinks].action = NULL;
             nlinks++;
         }
         for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
@@ -562,6 +621,7 @@ static void walk_node(struct dom_node *n) {
             links[nlinks].url[0] = '\0';
             links[nlinks].row = -1;
             links[nlinks].field = n;
+            links[nlinks].action = NULL;
             nlinks++;
             walk_text(cell);
             WFLUSH(); /* trailing fragment keeps this link, not the next */
@@ -569,9 +629,67 @@ static void walk_node(struct dom_node *n) {
         }
         return;
     }
-    if (walk_block_tag(n->tag)) WNEWLINE();
+    if (n->tag == TAG_TEXTAREA) {
+        /* Multi-line text field: same box UI as text inputs. Diary:
+         * value defaults to the element's text content, like the DOM. */
+        int save = walk_link;
+        if (nlinks < MAX_LINKS) {
+            char cell[64];
+            const char *v = dom_attr(n, "value");
+            char *tc = NULL;
+            if (!v || !v[0]) {
+                tc = dom_text_content(n);
+                v = tc ? tc : "";
+            }
+            if (n == focused_input)
+                snprintf(cell, sizeof(cell), "[ %-27.27s_]", v);
+            else
+                snprintf(cell, sizeof(cell), "[ %-28.28s]", v);
+            free(tc);
+            walk_link = nlinks;
+            links[nlinks].url[0] = '\0';
+            links[nlinks].row = -1;
+            links[nlinks].field = n;
+            links[nlinks].action = NULL;
+            nlinks++;
+            walk_text(cell);
+            WFLUSH(); /* trailing fragment keeps this link, not the next */
+            walk_link = save;
+        }
+        return;
+    }
+    if (node_actionable(n)) {
+        walk_actionable(n);
+        return;
+    }
+    if (n->tag >= TAG_H1 && n->tag <= TAG_H6) {
+        int level = n->tag - TAG_H1 + 1;
+        char hashes[8];
+        for (int i = 0; i < level && i < 7; i++) hashes[i] = '#';
+        hashes[level < 7 ? level : 7] = '\0';
+        WNEWLINE();
+        walk_marker(hashes);
+    } else if (n->tag == TAG_LI) {
+        WNEWLINE();
+        walk_marker("*");
+    } else if (n->tag == TAG_HR) {
+        WNEWLINE();
+        walk_marker("----");
+        WNEWLINE();
+        return;
+    } else if (n->tag == TAG_BLOCKQUOTE) {
+        WNEWLINE();
+        walk_marker(">");
+    } else if (walk_block_tag(n->tag)) {
+        WNEWLINE();
+    }
     for (int i = 0; i < n->nkids; i++) walk_node(n->kids[i]);
     if (n->tag == TAG_P || n->tag == TAG_DIV) WNEWLINE();
+    if (n->tag == TAG_TD || n->tag == TAG_TH) {
+        /* Cells breathe: gap the next cell over. */
+        WFLUSH();
+        walk_marker(" ");
+    }
 }
 
 /* Finds the body element, if any. */
@@ -660,6 +778,21 @@ static void relayout(void) {
     struct lirun rruns[MAX_RUNS];
     int nrr = 0;
     for (int i = 0; i < ntoks && nlines < MAX_LINES; i++) {
+        if (toks[i].brk) {
+            /* Block boundary ends this line. Collapsing: nested divs
+             * emit runs of breaks, leading breaks open the page; both
+             * flush at most one (possibly zero) lines. */
+            if (clen > 0) {
+                cur[clen] = '\0';
+                snprintf(lines[nlines].text, sizeof(lines[nlines].text), "%s", cur);
+                memcpy(lines[nlines].runs, rruns, sizeof(rruns[0]) * (size_t)nrr);
+                lines[nlines].nrun = nrr;
+                nlines++;
+                clen = 0;
+                nrr = 0;
+            }
+            continue;
+        }
         size_t wl = strlen(toks[i].word);
         size_t need = clen + (clen ? 1 : 0) + wl;
         if (need > (size_t)cols && clen > 0) {
@@ -812,7 +945,7 @@ static long stream_to_file(const char *url, const char *path) {
     }
     char req[URL_CAP + 128];
     snprintf(req, sizeof(req),
-             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: parasyteos-browser\r\nConnection: close\r\n\r\n",
+             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\nConnection: close\r\n\r\n",
              upath, host);
     size_t left = strlen(req);
     const char *q = req;
@@ -956,6 +1089,199 @@ static char *redirect_location(const char *base) {
     return out;
 }
 
+/* ---------------- async fetch + throbber ----------------
+ *
+ * fetch_page blocks (DNS, TCP, TLS can each stall for seconds), which
+ * used to freeze the whole window mid-click. Now the fetch runs in a
+ * forked child that streams the finished response through a pipe, while
+ * the parent pumps input and spins a pixel throbber. Esc cancels.
+ */
+static int loading = 0;
+static int throb_frame = 0;
+static pid_t fetch_pid = -1;
+static int fetch_fd_holder = -1;
+
+/* Pipe protocol, child -> parent: u32 body_len, then NUL-terminated
+ * status, http_status, http_location, cur_host, cur_port, then body. */
+static void w32(int fd, unsigned v) {
+    unsigned char b[4] = {
+        (unsigned char)v, (unsigned char)(v >> 8),
+        (unsigned char)(v >> 16), (unsigned char)(v >> 24)
+    };
+    write_all(fd, (const char *)b, 4);
+}
+
+static void wstr(int fd, const char *s) {
+    write_all(fd, s, strlen(s) + 1);
+}
+
+/* Starts a fetch; returns 0 when the child is off, -1 on immediate
+ * failure (status already set). Completion arrives via fetch_wait. */
+static int fetch_async(const char *url) {
+    int pfd[2];
+    if (pipe(pfd) < 0) {
+        fetch_fail("pipe failed");
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        fetch_fail("fork failed");
+        return -1;
+    }
+    if (pid == 0) {
+        /* Child: fetch, stream the result, die. No display, no input. */
+        close(pfd[0]);
+        int r = fetch_page(url);
+        w32(pfd[1], (unsigned)body_len);
+        wstr(pfd[1], status);
+        wstr(pfd[1], http_status);
+        wstr(pfd[1], http_location);
+        wstr(pfd[1], cur_host);
+        wstr(pfd[1], cur_port);
+        if (body_len > 0) write_all(pfd[1], body, body_len);
+        close(pfd[1]);
+        _exit(r == 0 ? 0 : 1);
+    }
+    close(pfd[1]);
+    int fl = fcntl(pfd[0], F_GETFL, 0);
+    if (fl >= 0) fcntl(pfd[0], F_SETFL, fl | O_NONBLOCK);
+    fetch_pid = pid;
+    fetch_fd_holder = pfd[0];
+    loading = 1;
+    snprintf(status, sizeof(status), "Loading...");
+    present();
+    return 0;
+}
+
+/* Pumps the in-flight fetch: drains the pipe, spins the throbber,
+ * watches for Esc. Returns 0 with globals filled, -1 on failure. */
+static int fetch_wait(void) {
+    if (fetch_pid < 0) return -1;
+    static char *acc = NULL;
+    static size_t acc_cap = 0;
+    if (!acc) {
+        acc_cap = BODY_CAP + 4096;
+        acc = malloc(acc_cap);
+        if (!acc) {
+            fetch_fail("out of memory");
+            goto fail;
+        }
+    }
+    size_t got = 0;
+    int child_done = 0;
+    for (;;) {
+        struct pollfd fds[2];
+        fds[0].fd = fetch_fd_holder;
+        fds[0].events = POLLIN;
+        fds[1].fd = input_fd;
+        fds[1].events = POLLIN;
+        int pr = poll(fds, 2, 150);
+        if (pr > 0 && (fds[1].revents & POLLIN)) {
+            struct input_event ev;
+            ssize_t n = read(input_fd, &ev, sizeof(ev));
+            if (n == (ssize_t)sizeof(ev) && ev.kind == EV_KEYDOWN && ev.x == KEY_ESC) {
+                kill(fetch_pid, 9);
+                fetch_fail("cancelled");
+                goto fail;
+            }
+            /* Anything else waits: the page is still coming. */
+        }
+        if (pr > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
+            for (;;) {
+                if (got >= acc_cap) break;
+                ssize_t n = read(fetch_fd_holder, acc + got, acc_cap - got);
+                if (n > 0) {
+                    got += (size_t)n;
+                    continue;
+                }
+                break;
+            }
+        }
+        {
+            int st = 0;
+            pid_t w = waitpid(fetch_pid, &st, WNOHANG);
+            if (w == fetch_pid) child_done = 1;
+        }
+        throb_frame++;
+        present();
+        if (child_done) {
+            /* Drain anything the exit raced. */
+            for (;;) {
+                if (got >= acc_cap) break;
+                ssize_t n = read(fetch_fd_holder, acc + got, acc_cap - got);
+                if (n <= 0) break;
+                got += (size_t)n;
+            }
+            break;
+        }
+    }
+    close(fetch_fd_holder);
+    fetch_fd_holder = -1;
+    {
+        int st = 0;
+        waitpid(fetch_pid, &st, 0);
+        fetch_pid = -1;
+        loading = 0;
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            if (!status[0] || strcmp(status, "Loading...") == 0)
+                fetch_fail("fetch failed");
+            present();
+            return -1;
+        }
+    }
+    /* Unpack: body_len, 5 NUL strings, body. */
+    {
+        size_t at = 0;
+        unsigned blen = 0;
+        if (got >= 4)
+            blen = (unsigned char)acc[0] | ((unsigned char)acc[1] << 8) |
+                   ((unsigned char)acc[2] << 16) | ((unsigned char)acc[3] << 24);
+        at = 4;
+        char *strs[5] = {status, http_status, http_location, cur_host, cur_port};
+        size_t caps[5] = {sizeof(status), sizeof(http_status), sizeof(http_location),
+                          sizeof(cur_host), sizeof(cur_port)};
+        for (int i = 0; i < 5; i++) {
+            size_t start = at;
+            while (at < got && acc[at]) at++;
+            if (at >= got) {
+                fetch_fail("fetch garbled");
+                present();
+                return -1;
+            }
+            size_t n = at - start;
+            if (n >= caps[i]) n = caps[i] - 1;
+            memcpy(strs[i], acc + start, n);
+            strs[i][n] = '\0';
+            at++;
+        }
+        if (blen > BODY_CAP - 1 || at + blen > got) {
+            fetch_fail("fetch garbled");
+            present();
+            return -1;
+        }
+        memcpy(body, acc + at, blen);
+        body_len = blen;
+        body[body_len] = '\0';
+    }
+    present();
+    return 0;
+fail:
+    if (fetch_fd_holder >= 0) {
+        close(fetch_fd_holder);
+        fetch_fd_holder = -1;
+    }
+    if (fetch_pid >= 0) {
+        int st = 0;
+        waitpid(fetch_pid, &st, WNOHANG);
+        fetch_pid = -1;
+    }
+    loading = 0;
+    present();
+    return -1;
+}
+
 static void navigate(const char *url, int record) {
     char full[URL_CAP];
     if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
@@ -995,7 +1321,11 @@ static void navigate(const char *url, int record) {
      * the Location URL, same-method GET, bounded hops. */
     int fetched = 0;
     for (int hops = 0; hops < 5; hops++) {
-        if (fetch_page(full) != 0) return;
+        if (fetch_async(full) != 0) {
+            present();
+            return;
+        }
+        if (fetch_wait() != 0) return; /* status already shown live */
         fetched = 1;
         char *loc = redirect_location(full);
         if (!loc) break;
@@ -1221,8 +1551,29 @@ static void render(void) {
     syscall(SYS_WINDOW_SET_TITLE, win, title, 0, 0, 0, 0);
 }
 
+/* Pixelated throbber: a rotating bar in an 8x8 cell, 4 frames. */
+static void draw_throbber(void) {
+    static const unsigned char frames[4][8] = {
+        {0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+        {0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0},
+        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff},
+        {0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03},
+    };
+    unsigned int *pp = (unsigned int *)win_buf;
+    unsigned y0 = win_h > STATUS_H ? win_h - STATUS_H : 0;
+    const unsigned char *f = frames[throb_frame & 3];
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            int sx = 4 + x, sy = (int)y0 + 4 + y;
+            if (sx < 0 || sx >= (int)win_w || sy < 0 || sy >= (int)win_h) continue;
+            pp[sy * win_w + sx] = (f[y] & (0x80 >> x)) ? 0x004C54D2 : BG_BAR;
+        }
+    }
+}
+
 static void present(void) {
     render();
+    if (loading) draw_throbber();
     syscall(SYS_WINDOW_PRESENT, win, 0, 0, 0, 0, 0, 0);
     syscall(SYS_DISPLAY_PRESENT, 0, 0, 0, 0, 0, 0, 0);
 }
@@ -1237,6 +1588,23 @@ static void click_page(int px, int py) {
     if (lr < 0 || lr >= nlines) return;
     for (int k = 0; k < nlinks; k++) {
         if (links[k].row == lr && c >= links[k].c0 && c < links[k].c1) {
+            if (links[k].action) {
+                /* Script-driven control: run the page's own click
+                 * handlers, then re-layout (handlers mutate the tree).
+                 * A <button> inside a form also submits, mirroring the
+                 * browser default action. */
+                if (page_js) jsdom_click_node(page_js, links[k].action);
+                struct dom_node *f = links[k].action;
+                while (f && f->tag != TAG_FORM) f = f->parent;
+                if (f) {
+                    submit_form(links[k].action);
+                    return;
+                }
+                snprintf(status, sizeof(status), "clicked (page handled it)");
+                relayout();
+                present();
+                return;
+            }
             if (links[k].field) {
                 /* Form field: text focuses, submit clicks through. */
                 const char *type = dom_attr(links[k].field, "type");
@@ -1281,13 +1649,18 @@ static void submit_form(struct dom_node *from) {
         stack[sp++] = scope;
         while (sp > 0) {
             struct dom_node *n = stack[--sp];
-            if (n->tag == TAG_INPUT) {
+            if (n->tag == TAG_INPUT || n->tag == TAG_TEXTAREA) {
                 const char *type = dom_attr(n, "type");
                 int is_button = type && (strcasecmp(type, "submit") == 0 ||
                                          strcasecmp(type, "button") == 0);
                 const char *nm = dom_attr(n, "name");
                 if (!is_button && nm && nm[0]) {
                     const char *v = dom_attr(n, "value");
+                    char *tc = NULL;
+                    if (!v && n->tag == TAG_TEXTAREA) {
+                        tc = dom_text_content(n);
+                        v = tc ? tc : "";
+                    }
                     if (!v) v = "";
                     char pair[512];
                     size_t pi = 0;
@@ -1298,6 +1671,7 @@ static void submit_form(struct dom_node *from) {
                     pair[pi] = '\0';
                     if (strlen(query) + strlen(pair) < sizeof(query) - 1)
                         strcat(query, pair);
+                    free(tc);
                 }
             }
             for (int i = n->nkids - 1; i >= 0; i--) {
@@ -1328,6 +1702,17 @@ static void push_fwd(const char *url) {
     snprintf(fwd[nfwd++], URL_CAP, "%s", url);
 }
 
+/* Fetches the current urlbar through the async path and lays out. */
+static void reload_current(void) {
+    if (fetch_async(urlbar) != 0) {
+        present();
+        return;
+    }
+    if (fetch_wait() != 0) return;
+    layout_html(body);
+    present();
+}
+
 static void go_back(void) {
     if (nhist == 0) return;
     if (urlbar[0]) push_fwd(urlbar);
@@ -1335,11 +1720,7 @@ static void go_back(void) {
     snprintf(prev, sizeof(prev), "%s", hist[--nhist]);
     snprintf(urlbar, sizeof(urlbar), "%s", prev);
     url_len = (int)strlen(urlbar);
-    if (fetch_page(prev) == 0) {
-        const char *sep = strstr(body, "\r\n\r\n");
-        layout_html(sep ? sep + 4 : body);
-    }
-    present();
+    reload_current();
 }
 
 static void go_forward(void) {
@@ -1349,11 +1730,7 @@ static void go_forward(void) {
     snprintf(next, sizeof(next), "%s", fwd[--nfwd]);
     snprintf(urlbar, sizeof(urlbar), "%s", next);
     url_len = (int)strlen(urlbar);
-    if (fetch_page(next) == 0) {
-        const char *sep = strstr(body, "\r\n\r\n");
-        layout_html(sep ? sep + 4 : body);
-    }
-    present();
+    reload_current();
 }
 
 static void go_home(void) {

@@ -234,9 +234,10 @@ static void draw_wallpaper(unsigned long buf, unsigned int w, unsigned int h) {
     unsigned int *px = (unsigned int *)buf;
     for (unsigned int y = 0; y < h; y++) {
         for (unsigned int x = 0; x < w; x++) {
-            // Gradient wallpaper
-            unsigned char r = (unsigned char)(x * 255 / w);
-            unsigned char g = (unsigned char)(y * 255 / h);
+            // Gradient wallpaper, teal family only:
+            // r 0..64, g 96..168, b 128 (the circled band).
+            unsigned char r = (unsigned char)(x * 64 / w);
+            unsigned char g = (unsigned char)(96 + y * 72 / h);
             unsigned char b = 128;
             px[y * w + x] = (r << 16) | (g << 8) | b;
         }
