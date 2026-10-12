@@ -41,6 +41,49 @@ static char *xstr(const char *s, size_t n) {
     return o;
 }
 
+/* Decodes character references in an attribute value (&amp; &lt; &gt;
+ * &quot; and numerics; the 8x8 font still gets '?' for the exotic).
+ * Unknown entities pass through literally: eating them would corrupt
+ * URLs that merely contain "&foo;". */
+static char *attr_decode(const char *s, size_t n) {
+    char *o = malloc(n + 1);
+    if (!o) return NULL;
+    size_t oi = 0;
+    for (size_t i = 0; i < n;) {
+        if (s[i] == '&') {
+            size_t semi = i + 1;
+            while (semi < n && semi - i < 12 && s[semi] != ';') semi++;
+            if (semi < n && s[semi] == ';' && semi - i > 1 && semi - i < 12) {
+                size_t el = semi - i - 1;
+                char ent[12] = {0};
+                memcpy(ent, s + i + 1, el);
+                char ec = 0;
+                if (strcmp(ent, "amp") == 0) ec = '&';
+                else if (strcmp(ent, "lt") == 0) ec = '<';
+                else if (strcmp(ent, "gt") == 0) ec = '>';
+                else if (strcmp(ent, "quot") == 0) ec = '"';
+                else if (ent[0] == '#') {
+                    unsigned long v = 0;
+                    if ((ent[1] == 'x' || ent[1] == 'X') && ent[2])
+                        v = strtoul(ent + 2, NULL, 16);
+                    else if (ent[1])
+                        v = strtoul(ent + 1, NULL, 10);
+                    ec = (v > 0 && v < 128) ? (char)v : '?';
+                    if (!ent[1] || (!v && ent[1] != '0')) ec = 0;
+                }
+                if (ec) {
+                    o[oi++] = ec;
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        o[oi++] = s[i++];
+    }
+    o[oi] = '\0';
+    return o;
+}
+
 struct dom_node *dom_element(const char *tag) {
     struct dom_node *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
@@ -260,7 +303,8 @@ static const char *parse_tag(const char *p, const char *end, char *namebuf, size
             const char *vs = p;
             while (p < end && (q ? *p != q : (*p != '>' && !isspace((unsigned char)*p)))) p++;
             free(val);
-            val = xstr(vs, (size_t)(p - vs));
+            val = attr_decode(vs, (size_t)(p - vs));
+            if (!val) val = xstr("", 0);
             if (q && p < end && *p == q) p++;
         }
         if (ai > 0 && val) {

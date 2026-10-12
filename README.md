@@ -103,67 +103,78 @@ gcc -nostdlib -static -no-pie -fno-stack-protector -fno-builtin \
 `guest/contracts.sh` is the contract suite (49 checks and counting): seccomp
 trap behavior, syscalls, processes, display, input, sockets, `poll` waits,
 local TLS for both cipher suites, P-256/GCM self-checks, the HTML parser,
-and the DOM bindings — all runnable headless under WSL2.
+and the DOM bindings (queries, timers, page flow, reflected properties,
+click dispatch) — all runnable headless under WSL2.
 
 ```sh
 bash guest/contracts.sh
 cargo test -p parasyte_core --lib   # 337 kernel unit tests
-cargo test -p parasyte_plat --lib   # platform tests (keymap, loader, …)
+cargo test -p parasyte_plat --lib   # platform tests 
 ```
 
 ## Capabilities
 
-**Processes.** `fork`/`execve`/`wait4`, `clone` (fork-like and thread-like),
-`futex`, signals with real handlers (`rt_sigreturn`, blocking, fault routing),
+**Processes.** `fork`/`execve`/`wait4`, `clone` 
+`futex`, signals with handlers (`rt_sigreturn`, blocking, fault routing),
 ptys (`/dev/ptmx`, `grantpt`, job control), pipes, shared memory (`memfd`,
 `shm_open`), and environment inheritance rules that keep the dynamic linker
 hermetic (empty guest env by design; the re-exec trampoline forwards only
 `DISPLAY`/`PARASYTEOS_*`).
 
-**Display.** A real X11 client (hand-rolled protocol, no toolkit): live windows
+**Display.** A X11 client (protocal built from scratch): live window
 at ~60fps with damage tracking, plus headless PPM snapshots. Windows support
 create/map/present/move/resize/destroy/raise/focus, 8x8 text, and 32-bit color.
-Input arrives as key/mouse/resize/close events; `poll` with a timeout genuinely
+Input arrives as key/mouse/resize/close events; `poll` with a timeout that
 waits (blocking host-side, then re-running the call). Keyboard covers the full
 PC/XT map including Shift symbols and both Enters.
 
-**Desktop.** Wallpaper, dock-style taskbar (launcher pill, per-app icon tiles,
-live window census with running indicators, clock), Alt+Tab, and window
-drag/resize/close. Apps embed *inside* the one desktop window: their outer X
-windows reparent into it (rendezvous via `/winserv/desktop/xid`), follow
-resizes through `/winserv/desktop/geom`, and keep their own input. Resizing the
-OS window rebuilds every buffer and re-lays out.
+**Desktop.** 
+Resizing the OS window rebuilds every buffer and re-lays out.
 
-**Terminal & shell.** Multi-tab terminal over ptys; `sh2` with PATH lookup,
+**Terminal & shell.** Multiiple tabs possible in terminal over ptys; `sh2` with PATH lookup,
 redirection, pipes, background jobs, env expansion, and builtins.
 
-**Networking.** Full socket delegation (stream/datagram, socketpair, options,
-nonblocking `connect` with timeout), a static-friendly resolver (numeric,
-`/etc/hosts`, hand-built DNS over UDP with TCP fallback across every
+**Networking.** Complete socket delegation (stream/datagram, socketpair, options,
+nonblocking `connect` with timeout), a resolver (numeric,
+`/etc/hosts`, rebuilt DNS over UDP with TCP fallback across every
 nameserver), HTTP/1.1 with chunked decoding, and redirect following.
-`fetch <host> [port] [path] [--body]` proves any of it in one line.
+`fetch <host> [port] [path] [--body]` usage.
 
 **TLS 1.2.** Hand-rolled: `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` preferred
 (P-256 ECDH with on-curve validation, AES-GCM, SNI/groups/ALPN/sigalgs,
 `ServerKeyExchange` RSA/SHA-256 verification) with `TLS_RSA_WITH_AES_128_CBC_SHA`
-fallback. RSA certificates only, hostname checking with a real DER walk of
-SAN lists, expiry sanity — but no chain-of-trust validation (toy-grade, and it
-says so). Verified against real sites, not just localhost.
+fallback. RSA certificates only, hostname checking w DER walk of
+SAN lists, Works with google.com and other very basic sites
 
-**Browser.** One window: title strip (drag + close), nav row (back/forward/
-reload/home, dimmed when useless), blurple URL pill, bookmarks bar with a
-working star, page viewport, status line. Renders tag-stripped HTML with blue
-clickable links, scrollback, and history; downloads binaries to `/downloads`
-and runs them on click (explicit consent model). Bare hostnames gain `https://`,
-single words search, 301/302/303/307/308 followed, truncated closes tolerated.
+**Browser.** One window: title strip , nav row , blurple URL pill, bookmarks bar with a
+working star, page viewport, status line. Pages render as structured text by
+default — block elements (`div`/`p`/`li`/headings/…) break lines instead of
+collapsing into a blob.
+Text inputs *and* textareas draw as `[____]` boxes you focus, type in
+(Ctrl+U clears, Esc unfocuses), and submit with Enter; `<button>`s,
+`jsaction`/`onclick`/`role=button` hooks, and href-less anchors are clickable
+spans that dispatch `click` to the page's own scripts (theme toggles, menus)
+and re-render, submitting enclosing forms like a real default action.
+Fetches run async (fork + pipe) behind a pixel throbber with Esc-cancel, so
+slow pages never freeze the window. Sends a mainstream Chrome `User-Agent`
+(Google UA-sniffs toy agents onto an "unsupported browser" page). Downloads
+binaries to `/downloads` and runs them on click (explicit consent model). Bare
+hostnames gain `https://`, single words search, 301/302/303/307/308 followed,
+truncated closes tolerated, attribute entities (`&amp;` in URLs) decoded at
+parse time.
+This was the second most time consuming part of the project
 
 **JavaScript.** QuickJS linked straight into the browser (no daemon): pages
 parse to a real node tree (`guest/lib/dom.c`), scripts run pre-render against
 DOM bindings (`guest/lib/jsdom.c`) — `document`/`Element` queries and mutation,
-`innerHTML`, timers firing from the main loop with re-layout, synchronous XHR
-over our own sockets, `console.log`. One bad script never kills the rest.
-What the engine can't do (layout-geometry APIs, full modern surface) fails
-loudly per-script instead of silently.
+`innerHTML`, reflected content-attribute properties (`el.href = …`,
+`el.value = …` land on real attributes, so script-built links and values reach
+layout instead of dying as expandos), `performance.now()`, timers firing from
+the main loop with re-layout, synchronous XHR over our own sockets,
+`console.log`. One bad script never kills the rest; failures log the first
+two in full, then a single summary count, instead of a wall of text. What the
+engine can't do (layout-geometry APIs, full modern surface) fails loudly
+per-script instead of silently.
 
 **Sound.** 8-bit minimalist: write unsigned 8-bit mono 8000 Hz PCM to
 `/dev/audio` and the kernel streams it to the host player (PulseAudio).

@@ -46,6 +46,18 @@ int main(void) {
     printf("main text: %.40s\n", t ? t : "");
     free(t);
     dom_free(doc);
+    /* Entities in attribute values decode at parse (links carry &amp;). */
+    {
+        struct dom_doc *d2 = dom_parse("<a href=\"/s?a=1&amp;b=2&amp;c=&lt;x&gt;\">e</a>");
+        struct dom_node *a = d2 ? d2->root : NULL;
+        const char *hv = "";
+        if (a && a->nkids > 0) {
+            const char *h = dom_attr(a->kids[0], "href");
+            if (h) hv = h;
+        }
+        printf("ent href: %s\n", hv);
+        if (d2) dom_free(d2);
+    }
     printf("DOM_TEST:PASS\n");
     return 0;
 }

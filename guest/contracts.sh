@@ -379,7 +379,7 @@ PYEOF
     #     id lookup and script collection, all under parasyteos.
     "$cc" -static -no-pie -O2 -fno-stack-protector -o "$out/dom_test" dom_test.c lib/dom.c || exit 1
     r=$("$PARASYTEOS" "$out/dom_test" 2>/dev/null); rc=$?
-    if has "DOM_TEST:PASS" "$r" && has "by_id main: div" "$r" && [ "$rc" -eq 0 ]; then
+    if has "DOM_TEST:PASS" "$r" && has "by_id main: div" "$r" && has "ent href: /s?a=1&b=2&c=<x>" "$r" && [ "$rc" -eq 0 ]; then
         ok "HTML parser builds a queryable tree under parasyteos"
     else
         bad "dom_test: rc=$rc out=$r"
